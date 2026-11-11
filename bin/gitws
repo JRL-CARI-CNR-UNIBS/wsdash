@@ -1,0 +1,1060 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Manuel Beschi
+# SPDX-License-Identifier: Apache-2.0
+"""
+gitws - interactive overview of the git repositories from the current directory down.
+
+Usage:
+  gitws [PATH] [-d DEPTH] [--no-fetch] [-l]
+
+  PATH        directory to search from (default: current)
+  -d DEPTH    maximum search depth (default 8)
+  --no-fetch  do not run 'git fetch' in the background at startup
+  -l          print the table and exit (non-interactive)
+
+Main keys (press ? in the interface for the full list):
+  repo list:   ENTER open, f/F fetch, p pull, P push, U ff-only pull of all,
+               d only changed, / filter, s sort, o shell, r refresh, q quit
+  detail:      SPACE stage/unstage, a/u stage/unstage all, ENTER diff,
+               c commit, C commit with editor, p pull, P push, l log, x discard
+"""
+import argparse
+import curses
+import locale
+import os
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+PRUNE_DIRS = {"build", "install", "log", "node_modules", "__pycache__", "venv"}
+
+# Environment for background commands: never prompt for passwords/passphrases
+BG_ENV = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+BG_ENV.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
+
+STATE_FILES = [
+    ("MERGE_HEAD", "MERGE"), ("rebase-merge", "REBASE"), ("rebase-apply", "REBASE"),
+    ("CHERRY_PICK_HEAD", "CHERRY"), ("REVERT_HEAD", "REVERT"), ("BISECT_LOG", "BISECT"),
+]
+
+
+def git(repo, *args, timeout=60, env=BG_ENV):
+    try:
+        p = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, env=env,
+                           stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except OSError as e:
+        return 1, "", str(e)
+
+
+def last_line(text, default="error"):
+    lines = [l for l in text.strip().splitlines() if l.strip()]
+    return lines[-1].strip() if lines else default
+
+
+def ago(t):
+    if t is None:
+        return "never"
+    s = time.time() - t
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return f"{int(s // 60)} min ago"
+    if s < 86400:
+        return f"{int(s // 3600)} h ago"
+    return f"{int(s // 86400)} d ago"
+
+
+def find_repos(root, maxdepth):
+    out = []
+    base = root.rstrip(os.sep).count(os.sep)
+    for d, dirs, files in os.walk(root):
+        if ".git" in dirs or ".git" in files:
+            out.append(d)
+        if d.count(os.sep) - base >= maxdepth:
+            dirs[:] = []
+            continue
+        dirs[:] = sorted(x for x in dirs if not x.startswith(".") and x not in PRUNE_DIRS)
+    return out
+
+
+class FileEntry:
+    __slots__ = ("kind", "xy", "path", "orig")
+
+    def __init__(self, kind, xy, path, orig=None):
+        self.kind, self.xy, self.path, self.orig = kind, xy, path, orig
+
+    @property
+    def staged(self):
+        return self.kind in ("1", "2") and self.xy[0] != "."
+
+    @property
+    def unstaged(self):
+        return self.kind in ("1", "2") and self.xy[1] != "."
+
+
+class Repo:
+    def __init__(self, path, root):
+        self.path = path
+        rel = os.path.relpath(path, root)
+        self.name = os.path.basename(path) if rel == "." else rel
+        self.busy = 0
+        self.fetch_error = None
+        self.lock = threading.Lock()
+        self.__dict__.update(self._empty())
+
+    @staticmethod
+    def _empty():
+        return dict(error=None, branch="?", oid="", upstream=None, ahead=0, behind=0,
+                    stash=0, files=[], state="", last=None, fetch_time=None,
+                    remote="", remote_url="", remotes=[], has_head=False,
+                    outgoing=[], incoming=[])
+
+    # --- counters -----------------------------------------------------------
+    @property
+    def n_staged(self):
+        return sum(f.staged for f in self.files)
+
+    @property
+    def n_unstaged(self):
+        return sum(f.unstaged for f in self.files)
+
+    @property
+    def n_untracked(self):
+        return sum(f.kind == "?" for f in self.files)
+
+    @property
+    def n_conflicts(self):
+        return sum(f.kind == "u" for f in self.files)
+
+    @property
+    def detached(self):
+        return self.branch == "(detached)"
+
+    @property
+    def dirty(self):
+        return bool(self.files)
+
+    def interesting(self):
+        return bool(self.error or self.files or self.ahead or self.behind or self.stash
+                    or self.state or self.fetch_error or self.detached
+                    or (not self.upstream and self.outgoing))
+
+    def score(self):
+        return (bool(self.error) * 100 + self.n_conflicts * 50 + bool(self.state) * 40
+                + bool(self.behind) * 20 + bool(self.ahead) * 10 + bool(self.files) * 5
+                + bool(self.stash))
+
+    def branch_label(self):
+        if self.detached:
+            return f"({self.oid[:8]})"
+        return self.branch
+
+    # --- loading ----------------------------------------------------------
+    def refresh(self):
+        d = self._empty()
+        rc, out, err = git(self.path, "--no-optional-locks", "status", "--porcelain=v2",
+                           "--branch", "--show-stash", "-z", "--untracked-files=all")
+        if rc != 0:
+            d["error"] = last_line(err)
+            self.__dict__.update(d)
+            return
+        toks = out.split("\0")
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            i += 1
+            if not t:
+                continue
+            if t.startswith("# "):
+                p = t[2:].split(" ")
+                if p[0] == "branch.oid":
+                    d["oid"] = p[1]
+                    d["has_head"] = p[1] != "(initial)"
+                elif p[0] == "branch.head":
+                    d["branch"] = p[1]
+                elif p[0] == "branch.upstream":
+                    d["upstream"] = p[1]
+                elif p[0] == "branch.ab":
+                    d["ahead"], d["behind"] = int(p[1][1:]), int(p[2][1:])
+                elif p[0] == "stash":
+                    d["stash"] = int(p[1])
+            elif t[0] == "1":
+                f = t.split(" ", 8)
+                d["files"].append(FileEntry("1", f[1], f[8]))
+            elif t[0] == "2":
+                f = t.split(" ", 9)
+                orig = toks[i] if i < len(toks) else None
+                i += 1
+                d["files"].append(FileEntry("2", f[1], f[9], orig))
+            elif t[0] == "u":
+                f = t.split(" ", 10)
+                d["files"].append(FileEntry("u", f[1], f[10]))
+            elif t[0] == "?":
+                d["files"].append(FileEntry("?", "??", t[2:]))
+
+        fmt = "--format=%h%x1f%s%x1f%cr%x1f%an"
+        if d["has_head"]:
+            rc, o, _ = git(self.path, "log", "-1", fmt)
+            if rc == 0 and o.strip():
+                d["last"] = o.strip().split("\x1f")
+
+        rc, o, _ = git(self.path, "rev-parse", "--absolute-git-dir", "--git-common-dir")
+        if rc == 0:
+            gd = o.splitlines()
+            gitdir = gd[0]
+            common = gd[1] if len(gd) > 1 else gitdir
+            if not os.path.isabs(common):
+                common = os.path.normpath(os.path.join(self.path, common))
+            for fn, label in STATE_FILES:
+                if os.path.exists(os.path.join(gitdir, fn)):
+                    d["state"] = label
+                    break
+            for g in (gitdir, common):
+                fh = os.path.join(g, "FETCH_HEAD")
+                if os.path.exists(fh):
+                    d["fetch_time"] = os.path.getmtime(fh)
+                    break
+
+        rc, o, _ = git(self.path, "remote")
+        d["remotes"] = o.split() if rc == 0 else []
+        if d["upstream"] and d["upstream"].split("/")[0] in d["remotes"]:
+            d["remote"] = d["upstream"].split("/")[0]
+        elif "origin" in d["remotes"]:
+            d["remote"] = "origin"
+        elif d["remotes"]:
+            d["remote"] = d["remotes"][0]
+        if d["remote"]:
+            rc, o, _ = git(self.path, "config", "--get", f"remote.{d['remote']}.url")
+            d["remote_url"] = o.strip()
+
+        lfmt = "--format=%h%x1f%s%x1f%cr"
+        if d["upstream"] and d["ahead"]:
+            rc, o, _ = git(self.path, "log", lfmt, "-n", "50", "@{u}..HEAD")
+            d["outgoing"] = [l.split("\x1f") for l in o.splitlines() if l]
+        elif not d["upstream"] and d["has_head"] and d["remotes"]:
+            rc, o, _ = git(self.path, "log", lfmt, "-n", "50", "HEAD", "--not", "--remotes")
+            d["outgoing"] = [l.split("\x1f") for l in o.splitlines() if l]
+        if d["upstream"] and d["behind"]:
+            rc, o, _ = git(self.path, "log", lfmt, "-n", "50", "HEAD..@{u}")
+            d["incoming"] = [l.split("\x1f") for l in o.splitlines() if l]
+
+        self.__dict__.update(d)
+
+    def fetch(self):
+        rc, _, err = git(self.path, "fetch", "--all", "--prune", "--quiet", timeout=120)
+        self.fetch_error = last_line(err) if rc != 0 else None
+        self.refresh()
+
+    def pull_ff(self):
+        rc, _, err = git(self.path, "pull", "--ff-only", "--quiet", timeout=120)
+        self.refresh()
+        return rc, err
+
+
+# ---------------------------------------------------------------------------
+# curses interface
+# ---------------------------------------------------------------------------
+GREEN, YELLOW, RED, CYAN, MAGENTA, BLUE, TITLE = range(1, 8)
+
+LIST_HELP = [
+    ("ENTER / →", "open the repo (changed files, commits, ...)"),
+    ("↑↓ j k PgUp PgDn g G", "move"),
+    ("f", "fetch the selected repo"),
+    ("F", "fetch all repos (in background)"),
+    ("p", "pull the selected repo"),
+    ("P", "push the selected repo"),
+    ("U", "pull --ff-only all repos that are behind and have no changes"),
+    ("l", "log of the selected repo"),
+    ("d", "show only repos that need attention"),
+    ("/", "filter by name (empty = no filter)"),
+    ("s", "sort by name / by urgency"),
+    ("o", "open a shell in the repo (exit to return)"),
+    ("r", "reload the status of all repos"),
+    ("q Esc", "quit"),
+]
+REPO_HELP = [
+    ("↑↓ j k", "select file"),
+    ("SPACE", "stage / unstage the file"),
+    ("a", "stage everything (git add -A)"),
+    ("u", "unstage everything (git reset)"),
+    ("ENTER / →", "diff of the selected file"),
+    ("D", "full diff (staged + unstaged)"),
+    ("c", "commit (asks for the message)"),
+    ("C", "commit with editor (git commit -v)"),
+    ("p / P", "pull / push"),
+    ("f", "fetch"),
+    ("l", "graph log (HEAD and upstream)"),
+    ("x", "discard changes to the file / delete untracked file"),
+    ("z", "git stash push  (Z = stash pop)"),
+    ("o", "open a shell in the repo"),
+    ("r", "reload"),
+    ("q ← Esc", "back to the list"),
+]
+
+
+class UI:
+    def __init__(self, scr, root, repos, do_fetch):
+        self.scr = scr
+        self.root = root
+        self.repos = repos
+        self.do_fetch = do_fetch
+        self.pool = ThreadPoolExecutor(max_workers=8)
+        self.sel = 0
+        self.top = 0
+        self.filter = ""
+        self.only_dirty = False
+        self.sort_mode = 0
+        self.msg = ""
+        self.msg_err = False
+        self.msg_time = 0
+        self.busy_lock = threading.Lock()
+
+    # --- drawing helpers --------------------------------------------------
+    def C(self, n):
+        return curses.color_pair(n) if curses.has_colors() else 0
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return x
+        maxlen = w - x - (1 if y == h - 1 else 0)
+        if maxlen <= 0:
+            return x
+        t = text[:maxlen]
+        try:
+            self.scr.addstr(y, x, t, attr)
+        except curses.error:
+            pass
+        return x + len(t)
+
+    def put_segs(self, y, segs, x=0, extra=0, fill=False):
+        for text, attr in segs:
+            x = self.put(y, x, text, attr | extra)
+        if fill:
+            w = self.scr.getmaxyx()[1]
+            if x < w:
+                self.put(y, x, " " * (w - x), extra)
+        return x
+
+    @staticmethod
+    def pad(segs, width):
+        n = sum(len(t) for t, _ in segs)
+        if n < width:
+            segs = segs + [(" " * (width - n), 0)]
+        return segs
+
+    def set_msg(self, text, err=False):
+        self.msg, self.msg_err, self.msg_time = text, err, time.time()
+
+    def draw_footer(self, keys):
+        h, w = self.scr.getmaxyx()
+        if self.msg and time.time() - self.msg_time < 8:
+            self.put(h - 2, 0, " " + self.msg, self.C(RED if self.msg_err else GREEN) | curses.A_BOLD)
+        x = 0
+        for k, label in keys:
+            x = self.put(h - 1, x, f" {k}", self.C(CYAN) | curses.A_BOLD)
+            x = self.put(h - 1, x, f" {label} ", curses.A_DIM)
+
+    def help_overlay(self, title, items):
+        self.scr.erase()
+        self.put(0, 0, f" {title} ", self.C(TITLE) | curses.A_BOLD)
+        kw = max(len(k) for k, _ in items) + 2
+        for i, (k, v) in enumerate(items):
+            self.put(2 + i, 2, k.ljust(kw), self.C(CYAN) | curses.A_BOLD)
+            self.put(2 + i, 2 + kw, v)
+        self.put(3 + len(items), 2, "press any key to return", curses.A_DIM)
+        self.scr.timeout(-1)
+        self.scr.getch()
+        self.scr.timeout(300)
+
+    # --- input ---------------------------------------------------------------
+    def prompt(self, label, initial=""):
+        buf = list(initial)
+        curses.curs_set(1)
+        self.scr.timeout(-1)
+        try:
+            while True:
+                h, w = self.scr.getmaxyx()
+                text = "".join(buf)
+                avail = w - len(label) - 2
+                shown = text[-avail:] if avail > 0 and len(text) > avail else text
+                self.scr.move(h - 1, 0)
+                self.scr.clrtoeol()
+                self.put(h - 1, 0, label, self.C(YELLOW) | curses.A_BOLD)
+                self.put(h - 1, len(label), shown)
+                try:
+                    self.scr.move(h - 1, min(w - 2, len(label) + len(shown)))
+                except curses.error:
+                    pass
+                try:
+                    ch = self.scr.get_wch()
+                except curses.error:
+                    continue
+                if ch in ("\n", "\r") or ch == curses.KEY_ENTER:
+                    return "".join(buf).strip()
+                if ch == "\x1b":
+                    return None
+                if ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    if buf:
+                        buf.pop()
+                elif ch == "\x15":  # ctrl-u
+                    buf = []
+                elif isinstance(ch, str) and ch.isprintable():
+                    buf.append(ch)
+        finally:
+            curses.curs_set(0)
+            self.scr.timeout(300)
+
+    def confirm(self, label):
+        h, w = self.scr.getmaxyx()
+        self.scr.move(h - 1, 0)
+        self.scr.clrtoeol()
+        self.put(h - 1, 0, label + " [y/N] ", self.C(YELLOW) | curses.A_BOLD)
+        self.scr.timeout(-1)
+        try:
+            ch = self.scr.getch()
+        finally:
+            self.scr.timeout(300)
+        return ch in (ord("s"), ord("S"), ord("y"), ord("Y"))
+
+    # --- commands ------------------------------------------------------------
+    def run_term(self, cmd, cwd, pause=True, pager=False):
+        """Temporarily leave curses and run a command in the terminal."""
+        env = dict(os.environ)
+        if pager:
+            env.setdefault("LESS", "-R")
+        curses.def_prog_mode()
+        curses.endwin()
+        rc = 1
+        try:
+            if not pager:
+                print(f"\n\033[1;36m[{os.path.relpath(cwd, self.root)}]\033[0m "
+                      f"\033[1m$ {' '.join(cmd)}\033[0m\n", flush=True)
+            rc = subprocess.call(cmd, cwd=cwd, env=env)
+            if pause:
+                col = "32" if rc == 0 else "31"
+                input(f"\n\033[{col}m[exit {rc}]\033[0m press ENTER to return... ")
+        except (KeyboardInterrupt, EOFError):
+            pass
+        except OSError as e:
+            print(e)
+            input("press ENTER... ")
+        curses.reset_prog_mode()
+        self.scr.refresh()
+        return rc
+
+    def bg(self, repo, fn, *a):
+        with self.busy_lock:
+            repo.busy += 1
+
+        def job():
+            try:
+                fn(*a)
+            except Exception as e:  # noqa
+                self.set_msg(f"{repo.name}: {e}", err=True)
+            finally:
+                with self.busy_lock:
+                    repo.busy -= 1
+        self.pool.submit(job)
+
+    def refresh_all_sync(self):
+        self.scr.erase()
+        self.put(0, 0, f" Reading status of {len(self.repos)} repositories...", curses.A_BOLD)
+        self.scr.refresh()
+        list(self.pool.map(lambda r: r.refresh(), self.repos))
+
+    def fetch_all(self):
+        for r in self.repos:
+            if not r.error and r.remotes:
+                self.bg(r, r.fetch)
+
+    def do_pull(self, r):
+        if not r.upstream:
+            self.set_msg(f"{r.name}: no upstream configured for '{r.branch}'", err=True)
+            return
+        self.run_term(["git", "pull"], r.path)
+        r.refresh()
+
+    def do_push(self, r):
+        if r.detached:
+            self.set_msg(f"{r.name}: detached HEAD, not pushing", err=True)
+            return
+        if r.upstream:
+            cmd = ["git", "push"]
+        else:
+            if not r.remote:
+                self.set_msg(f"{r.name}: no remote configured", err=True)
+                return
+            if not self.confirm(f"No upstream: git push -u {r.remote} {r.branch}?"):
+                return
+            cmd = ["git", "push", "-u", r.remote, r.branch]
+        self.run_term(cmd, r.path)
+        r.refresh()
+
+    def do_log(self, r):
+        refs = ["HEAD", "@{u}"] if r.upstream else ["HEAD"]
+        if not r.has_head:
+            self.set_msg("no commits", err=True)
+            return
+        self.run_term(["git", "-p", "log", "--graph", "--decorate", "--color=always",
+                       "--format=%C(yellow)%h%C(auto)%d %s %C(dim)(%cr, %an)%C(reset)",
+                       *refs], r.path, pause=False, pager=True)
+
+    def do_shell(self, r):
+        sh = os.environ.get("SHELL", "/bin/bash")
+        print(f"\033[1mShell in {r.path}  -  'exit' to return to gitws\033[0m")
+        self.run_term([sh], r.path, pause=False)
+        r.refresh()
+
+    def pull_all_ff(self):
+        cand = [r for r in self.repos if r.upstream and r.behind and not r.ahead
+                and not (r.n_staged or r.n_unstaged or r.n_conflicts) and not r.state]
+        if not cand:
+            self.set_msg("no repos to fast-forward")
+            return
+        if not self.confirm(f"pull --ff-only on {len(cand)} repos?"):
+            return
+
+        def job(r):
+            rc, err = r.pull_ff()
+            if rc != 0:
+                self.set_msg(f"{r.name}: pull failed: {last_line(err)}", err=True)
+        for r in cand:
+            self.bg(r, job, r)
+        self.set_msg(f"pull --ff-only started on {len(cand)} repos")
+
+    # --- shared segments ---------------------------------------------------
+    def sync_segs(self, r):
+        segs = []
+        if r.detached:
+            segs.append(("detached", self.C(RED)))
+        elif not r.upstream:
+            n = len(r.outgoing)
+            segs.append(("no upstream" + (f" ↑{n}" if n else ""), self.C(MAGENTA)))
+        else:
+            if r.ahead:
+                segs.append((f"↑{r.ahead} ", self.C(CYAN) | curses.A_BOLD))
+            if r.behind:
+                segs.append((f"↓{r.behind} ", self.C(RED) | curses.A_BOLD))
+            if not r.ahead and not r.behind:
+                segs.append(("✓ sync", self.C(GREEN)))
+        if r.fetch_error:
+            segs.append((" ⚠fetch", self.C(RED)))
+        return segs
+
+    def change_segs(self, r):
+        segs = []
+        if r.n_conflicts:
+            segs.append((f"!{r.n_conflicts} ", self.C(RED) | curses.A_BOLD))
+        if r.n_staged:
+            segs.append((f"+{r.n_staged} ", self.C(GREEN) | curses.A_BOLD))
+        if r.n_unstaged:
+            segs.append((f"~{r.n_unstaged} ", self.C(YELLOW) | curses.A_BOLD))
+        if r.n_untracked:
+            segs.append((f"?{r.n_untracked} ", self.C(BLUE)))
+        if not segs:
+            segs.append(("clean", self.C(GREEN) | curses.A_DIM))
+        return segs
+
+    # --- list view -----------------------------------------------------------
+    def visible(self):
+        rs = [r for r in self.repos if not self.filter or self.filter.lower() in r.name.lower()]
+        if self.only_dirty:
+            rs = [r for r in rs if r.interesting()]
+        if self.sort_mode == 1:
+            rs = sorted(rs, key=lambda r: (-r.score(), r.name))
+        return rs
+
+    def draw_list(self, rs):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        self.put_segs(0, [(" gitws ", self.C(TITLE) | curses.A_BOLD), (" " + self.root, curses.A_BOLD)],
+                      extra=0)
+        nd = sum(r.dirty for r in self.repos)
+        na = sum(bool(r.ahead) or (not r.upstream and bool(r.outgoing)) for r in self.repos)
+        nb = sum(bool(r.behind) for r in self.repos)
+        nbusy = sum(bool(r.busy) for r in self.repos)
+        summ = [(f" {len(self.repos)} repos  ", 0),
+                (f"{nd} changed  ", self.C(YELLOW) if nd else curses.A_DIM),
+                (f"{na} to push  ", self.C(CYAN) if na else curses.A_DIM),
+                (f"{nb} to pull  ", self.C(RED) if nb else curses.A_DIM)]
+        if nbusy:
+            summ.append((f"⟳ {nbusy} running  ", self.C(MAGENTA) | curses.A_BOLD))
+        flags = []
+        if self.filter:
+            flags.append(f"filter: {self.filter}")
+        if self.only_dirty:
+            flags.append("only changed")
+        if self.sort_mode:
+            flags.append("sort: urgency")
+        if flags:
+            summ.append(("[" + ", ".join(flags) + "]", self.C(YELLOW)))
+        self.put_segs(1, summ)
+
+        nw = min(max([len(r.name) for r in rs] + [4]), max(20, w // 3))
+        bw = min(max([len(r.branch_label()) for r in rs] + [6]), 24)
+        hdr = ("  " + "REPO".ljust(nw) + "  " + "BRANCH".ljust(bw) + "  " + "REMOTE".ljust(16)
+               + "CHANGES".ljust(16) + "STASH".ljust(7) + "STATE".ljust(8) + "LAST COMMIT")
+        self.put(3, 0, hdr, curses.A_UNDERLINE | curses.A_DIM)
+
+        list_y = 4
+        list_h = max(1, h - list_y - 2)
+        if self.sel < self.top:
+            self.top = self.sel
+        if self.sel >= self.top + list_h:
+            self.top = self.sel - list_h + 1
+        if not rs:
+            self.put(list_y, 2, "no repositories" + (" (filter active)" if self.filter or self.only_dirty else ""),
+                     curses.A_DIM)
+        for i, r in enumerate(rs[self.top:self.top + list_h]):
+            idx = self.top + i
+            extra = curses.A_REVERSE if idx == self.sel else 0
+            segs = [("⟳ " if r.busy else "  ", self.C(MAGENTA) | curses.A_BOLD)]
+            name = r.name if len(r.name) <= nw else "…" + r.name[-(nw - 1):]
+            segs.append((name.ljust(nw) + "  ", curses.A_BOLD))
+            if r.error:
+                segs.append(("error: " + r.error, self.C(RED)))
+            else:
+                br = r.branch_label()
+                br = br if len(br) <= bw else br[:bw - 1] + "…"
+                segs.append((br.ljust(bw) + "  ", self.C(MAGENTA)))
+                segs += self.pad(self.sync_segs(r), 16)
+                segs += self.pad(self.change_segs(r), 16)
+                segs += self.pad([(f"≡{r.stash}", self.C(YELLOW))] if r.stash else [], 7)
+                segs += self.pad([(r.state, self.C(RED) | curses.A_BOLD)] if r.state else [], 8)
+                if r.last:
+                    segs.append((r.last[2], curses.A_DIM))
+            self.put_segs(list_y + i, segs, extra=extra, fill=bool(extra))
+
+        self.draw_footer([("↵", "open"), ("f/F", "fetch"), ("p", "pull"), ("P", "push"),
+                          ("U", "pull all"), ("d", "only chg."), ("/", "filter"),
+                          ("s", "sort"), ("o", "shell"), ("r", "refresh"), ("?", "help"),
+                          ("q", "quit")])
+        self.scr.refresh()
+        return list_h
+
+    def run(self):
+        curses.curs_set(0)
+        if curses.has_colors():
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                bgc = -1
+            except curses.error:
+                bgc = curses.COLOR_BLACK
+            curses.init_pair(GREEN, curses.COLOR_GREEN, bgc)
+            curses.init_pair(YELLOW, curses.COLOR_YELLOW, bgc)
+            curses.init_pair(RED, curses.COLOR_RED, bgc)
+            curses.init_pair(CYAN, curses.COLOR_CYAN, bgc)
+            curses.init_pair(MAGENTA, curses.COLOR_MAGENTA, bgc)
+            curses.init_pair(BLUE, curses.COLOR_BLUE, bgc)
+            curses.init_pair(TITLE, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        self.scr.timeout(300)
+        self.scr.keypad(True)
+
+        self.refresh_all_sync()
+        if self.do_fetch:
+            self.fetch_all()
+
+        while True:
+            rs = self.visible()
+            self.sel = max(0, min(self.sel, len(rs) - 1))
+            list_h = self.draw_list(rs)
+            k = self.scr.getch()
+            if k == -1 or k == curses.KEY_RESIZE:
+                continue
+            cur = rs[self.sel] if rs else None
+            if k in (ord("q"), 27):
+                break
+            elif k in (curses.KEY_DOWN, ord("j")):
+                self.sel += 1
+            elif k in (curses.KEY_UP, ord("k")):
+                self.sel -= 1
+            elif k == curses.KEY_NPAGE:
+                self.sel += list_h
+            elif k == curses.KEY_PPAGE:
+                self.sel -= list_h
+            elif k in (curses.KEY_HOME, ord("g")):
+                self.sel = 0
+            elif k in (curses.KEY_END, ord("G")):
+                self.sel = len(rs) - 1
+            elif k == ord("?"):
+                self.help_overlay("gitws - repository list", LIST_HELP)
+            elif k == ord("r"):
+                self.refresh_all_sync()
+                self.set_msg("status refreshed")
+            elif k == ord("F"):
+                self.fetch_all()
+                self.set_msg("fetch of all repos started in background")
+            elif k == ord("U"):
+                self.pull_all_ff()
+            elif k == ord("d"):
+                self.only_dirty = not self.only_dirty
+            elif k == ord("s"):
+                self.sort_mode = 1 - self.sort_mode
+            elif k == ord("/"):
+                f = self.prompt("filter: ", self.filter)
+                if f is not None:
+                    self.filter = f
+                    self.sel = 0
+            elif cur is None:
+                continue
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
+                if cur.error:
+                    self.set_msg(cur.error, err=True)
+                else:
+                    self.repo_view(cur)
+            elif k == ord("f"):
+                self.bg(cur, cur.fetch)
+            elif k == ord("p"):
+                self.do_pull(cur)
+            elif k == ord("P"):
+                self.do_push(cur)
+            elif k == ord("l"):
+                self.do_log(cur)
+            elif k == ord("o"):
+                self.do_shell(cur)
+        self.pool.shutdown(wait=False, cancel_futures=True)
+
+    # --- repo detail view --------------------------------------------------
+    def draw_repo(self, r, sel, top):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        self.put_segs(0, [(" ← ", self.C(TITLE) | curses.A_BOLD),
+                          (" " + r.name + " ", self.C(TITLE) | curses.A_BOLD),
+                          ("  " + r.path, curses.A_DIM),
+                          ("  ⟳" if r.busy else "", self.C(MAGENTA) | curses.A_BOLD)])
+        segs = [("branch: ", curses.A_DIM), (r.branch_label(), self.C(MAGENTA) | curses.A_BOLD)]
+        if r.upstream:
+            segs += [(" → ", curses.A_DIM), (r.upstream, self.C(MAGENTA)), ("   ", 0)]
+        else:
+            segs += [("   ", 0)]
+        segs += self.sync_segs(r)
+        if r.stash:
+            segs += [("   stash: ", curses.A_DIM), (str(r.stash), self.C(YELLOW) | curses.A_BOLD)]
+        if r.state:
+            segs += [("   ", 0), (f"{r.state} IN PROGRESS", self.C(RED) | curses.A_BOLD)]
+        self.put_segs(1, segs)
+        if r.last:
+            self.put_segs(2, [("last:    ", curses.A_DIM), (r.last[0] + " ", self.C(YELLOW)),
+                              (r.last[1], 0), (f"  ({r.last[2]}, {r.last[3]})", curses.A_DIM)])
+        else:
+            self.put(2, 0, "last:    no commits", curses.A_DIM)
+        segs = [("remote:  ", curses.A_DIM),
+                (f"{r.remote} {r.remote_url}" if r.remote else "none", 0),
+                ("   last fetch: ", curses.A_DIM), (ago(r.fetch_time), 0)]
+        if r.fetch_error:
+            segs += [("   fetch failed: " + r.fetch_error, self.C(RED))]
+        self.put_segs(3, segs)
+
+        # outgoing / incoming commits block
+        clines = []
+        if r.outgoing:
+            n = r.ahead if r.upstream else len(r.outgoing)
+            title = "Commits to push" if r.upstream else "Commits not on any remote"
+            clines.append([(f"{title} ({n}{'+' if n >= 50 and not r.upstream else ''}):",
+                            self.C(CYAN) | curses.A_BOLD)])
+            for c in r.outgoing[:5]:
+                clines.append([("  ↑ ", self.C(CYAN)), (c[0] + " ", self.C(YELLOW)), (c[1], 0),
+                               (f"  ({c[2]})", curses.A_DIM)])
+            if len(r.outgoing) > 5:
+                clines.append([(f"    … {n - 5} more", curses.A_DIM)])
+        if r.incoming:
+            clines.append([(f"Incoming commits from remote ({r.behind}):", self.C(RED) | curses.A_BOLD)])
+            for c in r.incoming[:5]:
+                clines.append([("  ↓ ", self.C(RED)), (c[0] + " ", self.C(YELLOW)), (c[1], 0),
+                               (f"  ({c[2]})", curses.A_DIM)])
+            if len(r.incoming) > 5:
+                clines.append([(f"    … {r.behind - 5} more", curses.A_DIM)])
+
+        files_y = 6
+        files_h = h - files_y - 2 - (len(clines) + 1 if clines else 0)
+        if files_h < 3:
+            keep = max(0, h - files_y - 2 - 3 - 1)
+            clines = clines[:keep]
+            files_h = h - files_y - 2 - (len(clines) + 1 if clines else 0)
+        files_h = max(1, files_h)
+
+        hdr = [(f"Changed files ({len(r.files)})  ", curses.A_BOLD)]
+        hdr += self.change_segs(r)
+        hdr += [("   (green = staged, red = unstaged)", curses.A_DIM)]
+        self.put_segs(5, hdr)
+
+        if sel < top:
+            top = sel
+        if sel >= top + files_h:
+            top = sel - files_h + 1
+        if not r.files:
+            self.put(files_y, 2, "no local changes", self.C(GREEN) | curses.A_DIM)
+        for i, f in enumerate(r.files[top:top + files_h]):
+            idx = top + i
+            extra = curses.A_REVERSE if idx == sel else 0
+            if f.kind == "?":
+                st = [("??", self.C(RED))]
+            elif f.kind == "u":
+                st = [(f.xy, self.C(RED) | curses.A_BOLD)]
+            else:
+                x, y = f.xy[0], f.xy[1]
+                st = [(x if x != "." else " ", self.C(GREEN) | curses.A_BOLD),
+                      (y if y != "." else " ", self.C(RED) | curses.A_BOLD)]
+            name = f"{f.orig} → {f.path}" if f.orig else f.path
+            segs = [("  ", 0)] + st + [("  " + name, 0)]
+            self.put_segs(files_y + i, segs, extra=extra, fill=bool(extra))
+        if len(r.files) > files_h:
+            self.put(files_y + files_h - 1, w - 12, f" {sel + 1}/{len(r.files)} ", curses.A_DIM)
+
+        cy = files_y + files_h + 1
+        for i, line in enumerate(clines):
+            self.put_segs(cy + i, line)
+
+        self.draw_footer([("space", "stage"), ("a/u", "stage/unstage all"), ("↵", "diff"),
+                          ("c", "commit"), ("p", "pull"), ("P", "push"), ("f", "fetch"),
+                          ("l", "log"), ("x", "discard"), ("o", "shell"), ("?", "help"),
+                          ("q", "back")])
+        self.scr.refresh()
+        return top, files_h
+
+    def repo_view(self, r):
+        sel = top = 0
+        r.refresh()
+        while True:
+            sel = max(0, min(sel, len(r.files) - 1))
+            top, files_h = self.draw_repo(r, sel, top)
+            k = self.scr.getch()
+            if k == -1 or k == curses.KEY_RESIZE:
+                continue
+            f = r.files[sel] if r.files else None
+            if k in (ord("q"), 27, curses.KEY_LEFT, ord("h")):
+                return
+            elif k in (curses.KEY_DOWN, ord("j")):
+                sel += 1
+            elif k in (curses.KEY_UP, ord("k")):
+                sel -= 1
+            elif k == curses.KEY_NPAGE:
+                sel += files_h
+            elif k == curses.KEY_PPAGE:
+                sel -= files_h
+            elif k in (curses.KEY_HOME, ord("g")):
+                sel = 0
+            elif k in (curses.KEY_END, ord("G")):
+                sel = len(r.files) - 1
+            elif k == ord("?"):
+                self.help_overlay(f"gitws - {r.name}", REPO_HELP)
+            elif k == ord("r"):
+                r.refresh()
+            elif k == ord("f"):
+                self.bg(r, r.fetch)
+            elif k == ord("p"):
+                self.do_pull(r)
+            elif k == ord("P"):
+                self.do_push(r)
+            elif k == ord("l"):
+                self.do_log(r)
+            elif k == ord("o"):
+                self.do_shell(r)
+            elif k == ord("a"):
+                self.git_action(r, ["add", "-A"], "everything staged")
+            elif k == ord("u"):
+                self.git_action(r, ["reset", "-q"], "everything unstaged")
+            elif k == ord("D"):
+                args = ["diff", "HEAD"] if r.has_head else ["diff", "--cached"]
+                self.run_term(["git", "-p", *args], r.path, pause=False, pager=True)
+            elif k == ord("c"):
+                self.do_commit(r)
+            elif k == ord("C"):
+                self.run_term(["git", "commit", "-v"], r.path)
+                r.refresh()
+            elif k == ord("z"):
+                if self.confirm("git stash push (including untracked)?"):
+                    self.git_action(r, ["stash", "push", "-u"], "changes stashed")
+            elif k == ord("Z"):
+                if r.stash and self.confirm("git stash pop?"):
+                    self.git_action(r, ["stash", "pop"], "stash restored")
+            elif f is None:
+                continue
+            elif k == ord(" "):
+                self.toggle_stage(r, f)
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT, ord("d")):
+                self.show_diff(r, f)
+            elif k == ord("x"):
+                self.discard(r, f)
+
+    def git_action(self, r, args, ok_msg):
+        rc, out, err = git(r.path, *args, env=os.environ)
+        if rc == 0:
+            self.set_msg(ok_msg)
+        else:
+            self.set_msg(f"git {' '.join(args)}: {last_line(err or out)}", err=True)
+        r.refresh()
+        return rc
+
+    def toggle_stage(self, r, f):
+        if f.kind == "u":
+            self.git_action(r, ["add", "--", f.path], f"conflict marked as resolved: {f.path}")
+        elif f.kind == "?" or f.unstaged:
+            self.git_action(r, ["add", "--", f.path], f"staged: {f.path}")
+        elif f.staged:
+            paths = [f.orig, f.path] if f.orig else [f.path]
+            if r.has_head:
+                self.git_action(r, ["restore", "--staged", "--", *paths], f"unstaged: {f.path}")
+            else:
+                self.git_action(r, ["rm", "--cached", "-q", "--", *paths], f"unstaged: {f.path}")
+
+    def show_diff(self, r, f):
+        if f.kind == "?":
+            cmd = ["git", "-p", "diff", "--no-index", "--", "/dev/null", f.path]
+        elif f.kind == "u":
+            cmd = ["git", "-p", "diff", "--", f.path]
+        else:
+            paths = [f.orig, f.path] if f.orig else [f.path]
+            base = ["diff", "-M", "HEAD"] if r.has_head else ["diff", "--cached"]
+            cmd = ["git", "-p", *base, "--", *paths]
+        self.run_term(cmd, r.path, pause=False, pager=True)
+
+    def discard(self, r, f):
+        if f.kind == "?":
+            if self.confirm(f"DELETE untracked file '{f.path}'?"):
+                self.git_action(r, ["clean", "-f", "--", f.path], f"deleted: {f.path}")
+        elif f.kind == "u":
+            self.set_msg("conflicted file: resolve it and press SPACE", err=True)
+        elif f.unstaged:
+            if self.confirm(f"Discard UNSTAGED changes to '{f.path}'?"):
+                self.git_action(r, ["restore", "--", f.path], f"changes discarded: {f.path}")
+        else:
+            self.set_msg("file has only staged changes: press SPACE to unstage them", err=True)
+
+    def do_commit(self, r):
+        add_all = False
+        if r.n_conflicts:
+            self.set_msg("resolve the conflicts before committing", err=True)
+            return
+        if r.n_staged == 0:
+            if not r.files:
+                self.set_msg("nothing to commit")
+                return
+            if not self.confirm("Nothing staged: add everything (git add -A) and commit?"):
+                return
+            add_all = True
+        msg = self.prompt("commit message (Esc cancels): ")
+        if not msg:
+            self.set_msg("commit cancelled")
+            return
+        if add_all and git(r.path, "add", "-A", env=os.environ)[0] != 0:
+            self.set_msg("git add -A failed", err=True)
+            r.refresh()
+            return
+        rc, out, err = git(r.path, "commit", "-m", msg, timeout=600, env=os.environ)
+        if rc == 0:
+            self.set_msg("commit: " + last_line(out.splitlines()[0] if out else "ok"))
+        else:
+            # show the full output (e.g. failed hooks)
+            curses.def_prog_mode()
+            curses.endwin()
+            print("\033[31mcommit failed:\033[0m\n" + out + err)
+            try:
+                input("press ENTER to return... ")
+            except (KeyboardInterrupt, EOFError):
+                pass
+            curses.reset_prog_mode()
+            self.scr.refresh()
+        r.refresh()
+
+
+# ---------------------------------------------------------------------------
+def print_table(root, repos):
+    R, G, Y, Rd, C, M, B, D = "\033[0m", "\033[32m", "\033[33m", "\033[31m", "\033[36m", "\033[35m", "\033[1m", "\033[2m"
+    nw = max([len(r.name) for r in repos] + [4])
+    bw = min(max([len(r.branch_label()) for r in repos] + [6]), 24)
+    print(f"{B}{root}{R}  ({len(repos)} repos)")
+    for r in repos:
+        line = f"  {B}{r.name.ljust(nw)}{R}  "
+        if r.error:
+            print(line + f"{Rd}error: {r.error}{R}")
+            continue
+        line += f"{M}{r.branch_label()[:bw].ljust(bw)}{R}  "
+        if r.detached:
+            sync = f"{Rd}detached{R}"
+            sl = 8
+        elif not r.upstream:
+            t = "no upstream" + (f" ↑{len(r.outgoing)}" if r.outgoing else "")
+            sync, sl = f"{M}{t}{R}", len(t)
+        else:
+            parts, sl = [], 0
+            if r.ahead:
+                parts.append(f"{C}↑{r.ahead}{R}")
+                sl += len(str(r.ahead)) + 2
+            if r.behind:
+                parts.append(f"{Rd}↓{r.behind}{R}")
+                sl += len(str(r.behind)) + 2
+            if not parts:
+                parts.append(f"{G}✓ sync{R}")
+                sl = 6
+            sync = " ".join(parts)
+        if r.fetch_error:
+            sync += f" {Rd}⚠fetch{R}"
+            sl += 7
+        line += sync + " " * max(1, 16 - sl)
+        ch = []
+        if r.n_conflicts:
+            ch.append(f"{Rd}!{r.n_conflicts}{R}")
+        if r.n_staged:
+            ch.append(f"{G}+{r.n_staged}{R}")
+        if r.n_unstaged:
+            ch.append(f"{Y}~{r.n_unstaged}{R}")
+        if r.n_untracked:
+            ch.append(f"\033[34m?{r.n_untracked}{R}")
+        line += " ".join(ch) if ch else f"{D}{G}clean{R}"
+        if r.stash:
+            line += f"  {Y}≡{r.stash}{R}"
+        if r.state:
+            line += f"  {Rd}{B}{r.state}{R}"
+        print(line)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Overview and management of the git repositories under a directory.")
+    ap.add_argument("path", nargs="?", default=".")
+    ap.add_argument("-d", "--depth", type=int, default=8, help="maximum depth (default 8)")
+    ap.add_argument("--no-fetch", action="store_true", help="do not fetch at startup")
+    ap.add_argument("-l", "--list", action="store_true", help="print the table and exit")
+    args = ap.parse_args()
+
+    root = os.path.abspath(args.path)
+    paths = find_repos(root, args.depth)
+    if not paths:
+        rc, out, _ = git(root, "rev-parse", "--show-toplevel")
+        if rc == 0:
+            paths = [out.strip()]
+            root = os.path.dirname(out.strip())
+    if not paths:
+        print(f"no git repositories under {root}", file=sys.stderr)
+        sys.exit(1)
+    repos = [Repo(p, root) for p in paths]
+
+    if args.list:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            if not args.no_fetch:
+                print(f"fetching {len(repos)} repos...", file=sys.stderr)
+                list(ex.map(lambda r: r.fetch(), repos))
+            else:
+                list(ex.map(lambda r: r.refresh(), repos))
+        print_table(root, repos)
+        return
+
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.wrapper(lambda scr: UI(scr, root, repos, not args.no_fetch).run())
+    except KeyboardInterrupt:
+        pass
+    os._exit(0)  # do not wait for fetches still running
+
+
+if __name__ == "__main__":
+    main()

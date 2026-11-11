@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Manuel Beschi
+# SPDX-License-Identifier: Apache-2.0
+"""cbfail - browse colcon build results per package.
+
+Usage:
+  cbfail                 interactive viewer of log/latest_build
+  cbfail -s              print a plain summary (no TUI)
+  cbfail -b 2            use the 2nd most recent build (1 = latest)
+  cbfail -l LOG_DIR      use a specific build log dir (e.g. log/build_2026-...)
+
+Keys (package list):  ↑/↓ j/k move, Enter open, f show only problems,
+                      b change build, q quit
+Keys (log view):      a all lines, e errors, w warnings+errors,
+                      n/N next/prev problem, / search, g/G top/bottom,
+                      PgUp/PgDn, q/Esc back
+"""
+import argparse
+import curses
+import os
+import re
+import sys
+
+ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+EVENT_RE = re.compile(r'^\[([0-9.]+)\] \(([^)]*)\) (\w+): (.*)$')
+RC_RE = re.compile(r"'rc': '?([^,'}]+)'?")
+
+ERROR_RE = re.compile(
+    r'(\berror\b|\bError\b|CMake Error|\*\*\*|undefined reference|'
+    r'Traceback \(most recent|fatal:|FAILED|No such file or directory|'
+    r'collect2:|Segmentation fault)')
+WARN_RE = re.compile(r'(\bwarning\b|\bWarning\b|CMake Warning|DeprecationWarning|'
+                     r'UserWarning|SetuptoolsDeprecationWarning)')
+# Lines that look like errors but usually are not
+ERROR_FALSE_RE = re.compile(r'(-Werror|error_code|_error\.|Error\.(h|hpp|cpp)|'
+                            r'Werror=|\berrors? generated\b.*0)')
+
+ORDER = {'FAILED': 0, 'ABORTED': 1, 'NOT BUILT': 2, 'RUNNING': 3, 'OK': 4}
+
+
+def classify(line):
+    if ERROR_RE.search(line) and not ERROR_FALSE_RE.search(line):
+        return 'E'
+    if WARN_RE.search(line):
+        return 'W'
+    return ''
+
+
+class Package:
+    def __init__(self, name):
+        self.name = name
+        self.status = 'NOT BUILT'
+        self.rc = None
+        self.t0 = None
+        self.t1 = None
+        self.lines = None  # loaded lazily
+        self.kinds = None
+        self.n_err = 0
+        self.n_warn = 0
+
+    @property
+    def duration(self):
+        if self.t0 is not None and self.t1 is not None:
+            return self.t1 - self.t0
+        return None
+
+
+def find_log_root(start):
+    d = os.path.abspath(start)
+    while True:
+        cand = os.path.join(d, 'log')
+        if os.path.isdir(cand) and any(n.startswith('build_') for n in os.listdir(cand)):
+            return cand
+        if os.path.basename(d) == 'log' and any(n.startswith('build_') for n in os.listdir(d)):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def list_builds(log_root):
+    builds = sorted((n for n in os.listdir(log_root)
+                     if n.startswith('build_') and os.path.isdir(os.path.join(log_root, n))),
+                    reverse=True)
+    return [os.path.join(log_root, b) for b in builds]
+
+
+def load_build(build_dir):
+    pkgs = {}
+    events = os.path.join(build_dir, 'events.log')
+    if not os.path.exists(events):
+        sys.exit(f'cbfail: {events} not found')
+    with open(events, errors='replace') as f:
+        for raw in f:
+            m = EVENT_RE.match(raw.rstrip('\n'))
+            if not m:
+                continue
+            t, ident, ev, payload = float(m.group(1)), m.group(2), m.group(3), m.group(4)
+            if ident == '-' or ev == 'JobUnselected':
+                continue
+            p = pkgs.setdefault(ident, Package(ident))
+            if ev == 'JobStarted':
+                p.t0 = t
+                p.status = 'RUNNING'
+            elif ev == 'JobEnded':
+                p.t1 = t
+                rm = RC_RE.search(payload)
+                p.rc = rm.group(1) if rm else '?'
+                if p.rc == '0':
+                    p.status = 'OK'
+                elif p.rc.startswith('SIG'):
+                    p.status = 'ABORTED'
+                else:
+                    p.status = 'FAILED'
+            elif ev == 'JobSkipped':
+                p.status = 'NOT BUILT'
+    for p in pkgs.values():
+        load_output(p, build_dir, full=False)
+    return sorted(pkgs.values(), key=lambda p: (ORDER.get(p.status, 9), p.name))
+
+
+def load_output(p, build_dir, full=True):
+    if p.lines is not None:
+        return
+    base = os.path.join(build_dir, p.name)
+    path = None
+    for fn in ('stdout_stderr.log', 'streams.log'):
+        if os.path.exists(os.path.join(base, fn)):
+            path = os.path.join(base, fn)
+            break
+    lines = []
+    if path:
+        with open(path, errors='replace') as f:
+            lines = [ANSI_RE.sub('', l.rstrip('\n')).replace('\t', '    ') for l in f]
+    kinds = [classify(l) for l in lines]
+    p.n_err = kinds.count('E')
+    p.n_warn = kinds.count('W')
+    if full:
+        p.lines, p.kinds = lines, kinds
+
+
+# ---------------------------------------------------------------- plain mode
+
+def print_summary(pkgs, build_dir, problems_only):
+    tty = sys.stdout.isatty()
+    col = {'FAILED': '31', 'ABORTED': '33', 'NOT BUILT': '35', 'RUNNING': '36', 'OK': '32'}
+    c = (lambda code, s: f'\x1b[{code}m{s}\x1b[0m') if tty else (lambda code, s: s)
+    print(f'Build: {build_dir}')
+    for p in pkgs:
+        if problems_only and p.status == 'OK' and p.n_err == 0 and p.n_warn == 0:
+            continue
+        d = f'{p.duration:6.1f}s' if p.duration is not None else '      -'
+        print(f"  {c(col.get(p.status, '0'), f'{p.status:<9}')}  {d}  "
+              f"E:{p.n_err:<3} W:{p.n_warn:<3} {p.name}")
+    counts = {}
+    for p in pkgs:
+        counts[p.status] = counts.get(p.status, 0) + 1
+    print('  ' + '  '.join(f'{k}: {v}' for k, v in sorted(counts.items(), key=lambda kv: ORDER.get(kv[0], 9))))
+    for p in pkgs:
+        if p.status == 'FAILED':
+            load_output(p, build_dir)
+            errs = [l for l, k in zip(p.lines, p.kinds) if k == 'E']
+            print(c('1;31', f'\n--- {p.name} (rc={p.rc}) errors ---'))
+            for l in errs[:20]:
+                print('  ' + l)
+            if len(errs) > 20:
+                print(f'  ... {len(errs) - 20} more')
+
+
+# ---------------------------------------------------------------- TUI
+
+class App:
+    def __init__(self, scr, builds, idx):
+        self.scr = scr
+        self.builds = builds
+        self.problems_only = False
+        self.set_build(idx)
+        curses.curs_set(0)
+        curses.use_default_colors()
+        for i, fg in enumerate([curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_GREEN,
+                                curses.COLOR_MAGENTA, curses.COLOR_CYAN, curses.COLOR_BLUE], 1):
+            curses.init_pair(i, fg, -1)
+        self.C = {'FAILED': curses.color_pair(1) | curses.A_BOLD,
+                  'ABORTED': curses.color_pair(2),
+                  'OK': curses.color_pair(3),
+                  'NOT BUILT': curses.color_pair(4),
+                  'RUNNING': curses.color_pair(5),
+                  'E': curses.color_pair(1),
+                  'W': curses.color_pair(2),
+                  'hl': curses.color_pair(6) | curses.A_BOLD}
+
+    def set_build(self, idx):
+        self.bidx = idx
+        self.build_dir = self.builds[idx]
+        self.pkgs = load_build(self.build_dir)
+        self.sel = 0
+        self.top = 0
+
+    def visible(self):
+        if not self.problems_only:
+            return self.pkgs
+        return [p for p in self.pkgs if p.status != 'OK' or p.n_err or p.n_warn]
+
+    def put(self, y, x, s, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and x < w:
+            try:
+                self.scr.addnstr(y, x, s, w - x - (1 if y == h - 1 else 0), attr)
+            except curses.error:
+                pass
+
+    def status_bar(self, text):
+        h, w = self.scr.getmaxyx()
+        self.put(h - 1, 0, text.ljust(w), curses.A_REVERSE)
+
+    # ---- package list
+    def run(self):
+        while True:
+            pkgs = self.visible()
+            self.sel = max(0, min(self.sel, len(pkgs) - 1))
+            self.draw_list(pkgs)
+            k = self.scr.getch()
+            h = self.scr.getmaxyx()[0]
+            if k in (ord('q'), 27):
+                return
+            elif k in (curses.KEY_DOWN, ord('j')):
+                self.sel += 1
+            elif k in (curses.KEY_UP, ord('k')):
+                self.sel -= 1
+            elif k == curses.KEY_NPAGE:
+                self.sel += h - 4
+            elif k == curses.KEY_PPAGE:
+                self.sel -= h - 4
+            elif k in (ord('g'), curses.KEY_HOME):
+                self.sel = 0
+            elif k in (ord('G'), curses.KEY_END):
+                self.sel = len(pkgs) - 1
+            elif k == ord('f'):
+                self.problems_only = not self.problems_only
+                self.sel = 0
+            elif k == ord('b'):
+                self.choose_build()
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT, ord('l')) and pkgs:
+                self.view(pkgs[self.sel])
+
+    def draw_list(self, pkgs):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        counts = {}
+        for p in self.pkgs:
+            counts[p.status] = counts.get(p.status, 0) + 1
+        title = f' {os.path.basename(self.build_dir)}  ' + '  '.join(
+            f'{k}:{v}' for k, v in sorted(counts.items(), key=lambda kv: ORDER.get(kv[0], 9)))
+        if self.problems_only:
+            title += '  [problems only]'
+        self.put(0, 0, title.ljust(w), curses.A_REVERSE | curses.A_BOLD)
+        self.put(1, 0, f"  {'STATUS':<10}{'TIME':>8}  {'ERR':>4} {'WARN':>5}  PACKAGE", curses.A_DIM)
+        rows = h - 3
+        if self.sel < self.top:
+            self.top = self.sel
+        elif self.sel >= self.top + rows:
+            self.top = self.sel - rows + 1
+        for i, p in enumerate(pkgs[self.top:self.top + rows]):
+            y = 2 + i
+            cur = (self.top + i) == self.sel
+            base = curses.A_REVERSE if cur else 0
+            self.put(y, 0, ' ' * w, base)
+            self.put(y, 0, '>' if cur else ' ', base)
+            self.put(y, 2, f'{p.status:<10}', self.C.get(p.status, 0) | base)
+            d = f'{p.duration:7.1f}s' if p.duration is not None else '       -'
+            self.put(y, 12, d, base)
+            self.put(y, 22, f'{p.n_err:>4}', (self.C['E'] if p.n_err else curses.A_DIM) | base)
+            self.put(y, 27, f'{p.n_warn:>5}', (self.C['W'] if p.n_warn else curses.A_DIM) | base)
+            self.put(y, 34, p.name, base | (curses.A_BOLD if p.status == 'FAILED' else 0))
+        if not pkgs:
+            self.put(3, 2, 'No packages to show.')
+        self.status_bar(' ↑↓ move  Enter open  f problems only  b other build  q quit')
+        self.scr.refresh()
+
+    def choose_build(self):
+        sel = self.bidx
+        while True:
+            self.scr.erase()
+            h, w = self.scr.getmaxyx()
+            self.put(0, 0, ' Choose build'.ljust(w), curses.A_REVERSE | curses.A_BOLD)
+            top = max(0, sel - (h - 3) + 1)
+            for i, b in enumerate(self.builds[top:top + h - 2]):
+                j = top + i
+                self.put(1 + i, 0, ('> ' if j == sel else '  ') + os.path.basename(b),
+                         curses.A_REVERSE if j == sel else 0)
+            self.status_bar(' ↑↓ move  Enter select  q back')
+            k = self.scr.getch()
+            if k in (curses.KEY_DOWN, ord('j')):
+                sel = min(sel + 1, len(self.builds) - 1)
+            elif k in (curses.KEY_UP, ord('k')):
+                sel = max(sel - 1, 0)
+            elif k in (10, 13, curses.KEY_ENTER):
+                self.set_build(sel)
+                return
+            elif k in (ord('q'), 27):
+                return
+
+    # ---- log view
+    def view(self, p):
+        load_output(p, self.build_dir)
+        mode = 'W' if (p.n_err or p.n_warn) else 'A'  # A all, W warn+err, E err only
+        ctx = 3
+        search = ''
+        top = 0
+        cursor = 0  # index into rows
+
+        def build_rows():
+            if mode == 'A':
+                return list(range(len(p.lines)))
+            want = {'E'} if mode == 'E' else {'E', 'W'}
+            keep = set()
+            for i, k in enumerate(p.kinds):
+                if k in want:
+                    keep.update(range(max(0, i - 1), min(len(p.lines), i + ctx + 1)))
+            out, prev = [], None
+            for i in sorted(keep):
+                if prev is not None and i != prev + 1:
+                    out.append(-1)  # separator
+                out.append(i)
+                prev = i
+            return out
+
+        def is_hit(i):
+            if i < 0:
+                return False
+            if search:
+                return search.lower() in p.lines[i].lower()
+            return p.kinds[i] in ({'E'} if mode == 'E' else {'E', 'W'})
+
+        rows = build_rows()
+        while True:
+            h, w = self.scr.getmaxyx()
+            body = h - 2
+            cursor = max(0, min(cursor, max(0, len(rows) - 1)))
+            if cursor < top:
+                top = cursor
+            elif cursor >= top + body:
+                top = cursor - body + 1
+            top = max(0, min(top, max(0, len(rows) - body)))
+            self.scr.erase()
+            mname = {'A': 'all', 'W': 'warnings+errors', 'E': 'errors'}[mode]
+            head = f' {p.name}  [{p.status} rc={p.rc}]  E:{p.n_err} W:{p.n_warn}  view: {mname}'
+            if search:
+                head += f'  search: "{search}"'
+            self.put(0, 0, head.ljust(w), curses.A_REVERSE | curses.A_BOLD)
+            if not p.lines:
+                self.put(2, 2, 'No output captured for this package.')
+            elif not rows:
+                self.put(2, 2, 'Nothing in this view. Press "a" to see the full log.')
+            for r, i in enumerate(rows[top:top + body]):
+                y = 1 + r
+                if i < 0:
+                    self.put(y, 0, '  ' + '·' * min(40, w - 3), curses.A_DIM)
+                    continue
+                kind = p.kinds[i]
+                attr = self.C.get(kind, 0)
+                if search and search.lower() in p.lines[i].lower():
+                    attr = self.C['hl']
+                if top + r == cursor:
+                    attr |= curses.A_REVERSE
+                self.put(y, 0, f'{i + 1:>5} ', curses.A_DIM)
+                self.put(y, 6, p.lines[i] or ' ', attr)
+            pos = f'{rows[cursor] + 1 if rows and rows[cursor] >= 0 else 0}/{len(p.lines)}'
+            self.status_bar(f' a all  e errors  w warn+err  n/N next/prev  / search  q back   {pos}')
+            self.scr.refresh()
+
+            k = self.scr.getch()
+            if k in (ord('q'), 27, curses.KEY_LEFT, ord('h')):
+                return
+            elif k in (curses.KEY_DOWN, ord('j')):
+                cursor += 1
+            elif k in (curses.KEY_UP, ord('k')):
+                cursor -= 1
+            elif k in (curses.KEY_NPAGE, ord(' ')):
+                cursor += body
+            elif k == curses.KEY_PPAGE:
+                cursor -= body
+            elif k in (ord('g'), curses.KEY_HOME):
+                cursor = 0
+            elif k in (ord('G'), curses.KEY_END):
+                cursor = len(rows) - 1
+            elif k in (ord('a'), ord('e'), ord('w')):
+                cur_line = rows[cursor] if rows and rows[cursor] >= 0 else 0
+                mode = chr(k).upper()
+                rows = build_rows()
+                # keep position near the same log line
+                cursor = next((j for j, i in enumerate(rows) if i >= cur_line), 0)
+            elif k == ord('n'):
+                cursor = next((j for j in range(cursor + 1, len(rows)) if is_hit(rows[j])), cursor)
+            elif k == ord('N'):
+                cursor = next((j for j in range(cursor - 1, -1, -1) if is_hit(rows[j])), cursor)
+            elif k == ord('/'):
+                search = self.prompt('/')
+                if search:
+                    cursor = next((j for j in range(cursor, len(rows)) if is_hit(rows[j])),
+                                  next((j for j in range(len(rows)) if is_hit(rows[j])), cursor))
+
+    def prompt(self, label):
+        h, w = self.scr.getmaxyx()
+        self.status_bar('')
+        self.put(h - 1, 0, label, curses.A_REVERSE)
+        curses.echo()
+        curses.curs_set(1)
+        try:
+            s = self.scr.getstr(h - 1, len(label), w - len(label) - 2).decode(errors='replace')
+        finally:
+            curses.noecho()
+            curses.curs_set(0)
+        return s.strip()
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Browse colcon build results per package.')
+    ap.add_argument('-l', '--log', help='build log dir (default: <ws>/log/latest_build)')
+    ap.add_argument('-b', '--build', type=int, default=1, help='N-th most recent build (1 = latest)')
+    ap.add_argument('-s', '--summary', action='store_true', help='print a summary, no TUI')
+    ap.add_argument('-a', '--all', action='store_true', help='summary: also list OK packages')
+    args = ap.parse_args()
+
+    if args.log:
+        build_dir = os.path.abspath(args.log)
+        builds = [build_dir]
+        idx = 0
+    else:
+        root = find_log_root(os.getcwd())
+        if not root:
+            sys.exit('cbfail: no colcon log/ directory found here or in parent dirs')
+        builds = list_builds(root)
+        if not builds:
+            sys.exit(f'cbfail: no builds in {root}')
+        idx = min(max(args.build, 1), len(builds)) - 1
+        build_dir = builds[idx]
+
+    if args.summary or not sys.stdout.isatty():
+        print_summary(load_build(build_dir), build_dir, problems_only=not args.all)
+        return
+    os.environ.setdefault('ESCDELAY', '25')
+    curses.wrapper(lambda scr: App(scr, builds, idx).run())
+
+
+if __name__ == '__main__':
+    main()

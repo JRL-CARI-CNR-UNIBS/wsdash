@@ -1,0 +1,1245 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Manuel Beschi
+# SPDX-License-Identifier: Apache-2.0
+"""
+cbws - interactive colcon build manager for a ROS 2 workspace.
+
+Usage:
+  cbws [-w WS] [-s]
+
+  -w WS   workspace root (default: found from the current directory upwards)
+  -s      print a status table and exit (non-interactive)
+
+It replaces the cb / cbp / cbu / cbs / cbpr aliases:
+  B  build all            (cb)       b  only selected      (cbp)
+  u  up to selected       (cbu)      a  from selected      (cbs)
+  t  cycle build type     (Default / Debug / Release / RelWithDebInfo / MinSizeRel)
+  x  clean selected       X  clean whole workspace
+  l  build log of the package (cbfail viewer), L browse the last build
+Press ? inside for the full list. Space marks several packages: actions then
+apply to all marked packages instead of the selected one.
+"""
+import argparse
+import curses
+import importlib.machinery
+import importlib.util
+import json
+import locale
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+BUILD_TYPES = [None, "Debug", "Release", "RelWithDebInfo", "MinSizeRel"]
+BT_SHORT = {"RelWithDebInfo": "RelWDeb", "MinSizeRel": "MinSize"}
+DEFAULT_OPTS = dict(build_type=None, jobs=0, symlink=True, continue_on_error=True,
+                    compile_commands=True, clean_cache=False, force_configure=False,
+                    extra_cmake="", extra_colcon="")
+SETTINGS = os.path.expanduser("~/.config/cbws/settings.json")
+SKIP_DIRS = {"build", "install", "log", "__pycache__", "node_modules", "venv"}
+EVENT_RE = re.compile(r"^\[([0-9.]+)\] \(([^)]*)\) (\w+): (.*)$")
+RC_RE = re.compile(r"'rc': '?([^,'}]+)'?")
+EDGE_RE = re.compile(r'^\s*"([^"]+)" -> "([^"]+)"')
+STATUS_ORDER = {"FAILED": 0, "ABORTED": 1, "SKIPPED": 2, "RUNNING": 3, "never": 4, "OK": 5}
+
+RED, YELLOW, GREEN, MAGENTA, CYAN, BLUE, TITLE = range(1, 8)  # 1-6 match cbfail
+
+
+def load_cbfail():
+    """Import ~/.local/bin/cbfail as a module to reuse its log parsing and viewer."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    path = os.path.join(here, "cbfail")
+    if not os.path.exists(path):
+        path = shutil.which("cbfail")
+    if not path:
+        return None
+    try:
+        sys.dont_write_bytecode = True
+        loader = importlib.machinery.SourceFileLoader("cbfail_mod", path)
+        spec = importlib.util.spec_from_loader("cbfail_mod", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+    except Exception:  # noqa
+        return None
+
+
+cbfail = load_cbfail()
+
+
+# ---------------------------------------------------------------------------
+# Workspace model
+# ---------------------------------------------------------------------------
+def find_ws(start):
+    d = os.path.abspath(start)
+    first_src = None
+    while True:
+        if os.path.isdir(os.path.join(d, "src")):
+            if any(os.path.isdir(os.path.join(d, x)) for x in ("build", "install", "log")):
+                return d
+            first_src = first_src or d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return first_src or os.path.abspath(start)
+        d = parent
+
+
+def colcon_q(ws, *args):
+    """Run a read-only colcon command without writing anything to log/."""
+    try:
+        p = subprocess.run(["colcon", "--log-base", os.devnull, *args], cwd=ws,
+                           capture_output=True, text=True, errors="replace", timeout=120)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, "", str(e)
+
+
+def ago(t):
+    if t is None:
+        return ""
+    s = time.time() - t
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return f"{int(s // 60)} min ago"
+    if s < 86400:
+        return f"{int(s // 3600)} h ago"
+    return f"{int(s // 86400)} d ago"
+
+
+def fmt_dur(d):
+    if d is None:
+        return ""
+    if d < 60:
+        return f"{d:.1f}s"
+    return f"{int(d // 60)}m{int(d % 60):02d}"
+
+
+def colcon_running(ws):
+    """PID of a 'colcon build' whose working directory is this workspace, if any."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().split(b"\0")
+            if not any(os.path.basename(c) == b"colcon" for c in cmd[:2]) or b"build" not in cmd:
+                continue
+            if os.path.realpath(f"/proc/{pid}/cwd") == ws:
+                return int(pid)
+        except OSError:
+            continue
+    return None
+
+
+class Pkg:
+    def __init__(self, name, path, ptype, order):
+        self.name, self.path, self.ptype, self.order = name, path, ptype, order
+        self.deps, self.rdeps = set(), set()
+        self.status = "never"
+        self.rc = None
+        self.t_end = None
+        self.dur = None
+        self.build_dir = None
+        self.last_ok = None
+        self.n_err = self.n_warn = 0
+        self.build_type = None  # None: not configured / not cmake
+        self.newest_src = None
+        self.changed = False
+
+    @property
+    def is_cmake(self):
+        return "cmake" in self.ptype
+
+    @property
+    def short_type(self):
+        return {"ros.ament_cmake": "ament", "ros.ament_python": "python",
+                "ros.cmake": "cmake", "cmake": "cmake"}.get(self.ptype, self.ptype)
+
+    def problem(self):
+        return self.status != "OK" or self.changed or self.n_err > 0
+
+
+class Workspace:
+    def __init__(self, root):
+        self.root = root
+        self.log_root = os.path.join(root, "log")
+        self.pkgs = {}
+        self.error = None
+        self.running_pid = None
+
+    def load_packages(self):
+        with ThreadPoolExecutor(2) as ex:
+            f_list = ex.submit(colcon_q, self.root, "list", "-t")
+            f_graph = ex.submit(colcon_q, self.root, "graph", "--dot")
+            rc, out, err = f_list.result()
+            grc, gout, _ = f_graph.result()
+        if rc != 0:
+            self.error = (err.strip().splitlines() or ["colcon list failed"])[-1]
+            return
+        pkgs = {}
+        for i, line in enumerate(out.splitlines()):
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                pkgs[parts[0]] = Pkg(parts[0], parts[1], parts[2].strip("()"), i)
+        if grc == 0:
+            for line in gout.splitlines():
+                m = EDGE_RE.match(line)
+                if m and m.group(1) in pkgs and m.group(2) in pkgs:
+                    pkgs[m.group(1)].deps.add(m.group(2))
+                    pkgs[m.group(2)].rdeps.add(m.group(1))
+        self.pkgs = pkgs
+
+    def builds(self):
+        if not os.path.isdir(self.log_root):
+            return []
+        names = sorted((n for n in os.listdir(self.log_root) if n.startswith("build_")
+                        and os.path.isdir(os.path.join(self.log_root, n))), reverse=True)
+        return [os.path.join(self.log_root, n) for n in names]
+
+    @staticmethod
+    def build_start(build_dir):
+        try:
+            return time.mktime(time.strptime(os.path.basename(build_dir), "build_%Y-%m-%d_%H-%M-%S"))
+        except ValueError:
+            return os.path.getmtime(build_dir)
+
+    @staticmethod
+    def parse_events(build_dir):
+        """{pkg: dict(status, rc, t0, t1)} for one build."""
+        res = {}
+        try:
+            f = open(os.path.join(build_dir, "events.log"), errors="replace")
+        except OSError:
+            return res
+        with f:
+            for raw in f:
+                m = EVENT_RE.match(raw.rstrip("\n"))
+                if not m or m.group(2) == "-":
+                    continue
+                t, ident, ev, payload = float(m.group(1)), m.group(2), m.group(3), m.group(4)
+                if ev == "JobUnselected":
+                    continue
+                e = res.setdefault(ident, dict(status=None, rc=None, t0=None, t1=None))
+                if ev == "JobStarted":
+                    e["t0"], e["status"] = t, "RUNNING"
+                elif ev == "JobEnded":
+                    rm = RC_RE.search(payload)
+                    rc = rm.group(1) if rm else "?"
+                    e["t1"], e["rc"] = t, rc
+                    e["status"] = "OK" if rc == "0" else ("ABORTED" if rc.startswith("SIG") else "FAILED")
+                elif ev == "JobSkipped":
+                    e["status"] = "SKIPPED"
+        return res
+
+    def scan_history(self, max_builds=60):
+        """Most recent build outcome of every package, looking back over old builds."""
+        self.running_pid = colcon_running(self.root)
+        pending = set(self.pkgs)
+        need_ok = set(self.pkgs)
+        for p in self.pkgs.values():
+            p.status, p.rc, p.t_end, p.dur, p.build_dir, p.last_ok = "never", None, None, None, None, None
+        for bi, bdir in enumerate(self.builds()[:max_builds]):
+            if not pending and not need_ok:
+                break
+            start = self.build_start(bdir)
+            for name, e in self.parse_events(bdir).items():
+                p = self.pkgs.get(name)
+                if p is None or e["status"] is None:
+                    continue
+                if e["status"] == "RUNNING" and not (bi == 0 and self.running_pid):
+                    continue  # interrupted without an end event: look at older builds
+                if name in pending:
+                    pending.discard(name)
+                    p.status, p.rc, p.build_dir = e["status"], e["rc"], bdir
+                    p.t_end = start + e["t1"] if e["t1"] is not None else None
+                    p.dur = e["t1"] - e["t0"] if e["t1"] is not None and e["t0"] is not None else None
+                if name in need_ok and e["status"] == "OK":
+                    need_ok.discard(name)
+                    p.last_ok = start + e["t1"]
+        for p in self.pkgs.values():
+            p.build_type = None
+            cache = os.path.join(self.root, "build", p.name, "CMakeCache.txt")
+            if p.is_cmake and os.path.exists(cache):
+                try:
+                    with open(cache, errors="replace") as f:
+                        for line in f:
+                            if line.startswith("CMAKE_BUILD_TYPE:"):
+                                p.build_type = line.split("=", 1)[1].strip()
+                                break
+                        else:
+                            p.build_type = ""
+                except OSError:
+                    pass
+            p.changed = bool(p.newest_src and p.last_ok and p.newest_src > p.last_ok + 1)
+
+    def scan_logs(self):
+        """Error / warning counts of each package's last build log (uses cbfail)."""
+        if not cbfail:
+            return
+        for p in list(self.pkgs.values()):
+            if p.build_dir and p.status != "RUNNING":
+                cp = cbfail.Package(p.name)
+                try:
+                    cbfail.load_output(cp, p.build_dir, full=False)
+                except Exception:  # noqa
+                    continue
+                p.n_err, p.n_warn = cp.n_err, cp.n_warn
+            else:
+                p.n_err = p.n_warn = 0
+
+    def scan_sources(self):
+        """Newest file modification time in each package source tree."""
+        for p in list(self.pkgs.values()):
+            top = os.path.join(self.root, p.path)
+            newest = 0.0
+            for d, dirs, files in os.walk(top):
+                dirs[:] = [x for x in dirs if not x.startswith(".") and x not in SKIP_DIRS
+                           and not os.path.exists(os.path.join(d, x, "package.xml"))]
+                for fn in files:
+                    try:
+                        mt = os.lstat(os.path.join(d, fn)).st_mtime
+                    except OSError:
+                        continue
+                    if mt > newest:
+                        newest = mt
+            p.newest_src = newest or None
+            p.changed = bool(p.newest_src and p.last_ok and p.newest_src > p.last_ok + 1)
+
+    def closure(self, name, attr):
+        seen, stack = set(), [name]
+        while stack:
+            for n in getattr(self.pkgs[stack.pop()], attr):
+                if n not in seen:
+                    seen.add(n)
+                    stack.append(n)
+        return seen
+
+
+def load_settings(ws):
+    try:
+        with open(SETTINGS) as f:
+            data = json.load(f).get(ws, {})
+    except (OSError, ValueError):
+        data = {}
+    opts = dict(DEFAULT_OPTS)
+    opts.update({k: v for k, v in data.items() if k in DEFAULT_OPTS})
+    return opts
+
+
+def save_settings(ws, opts):
+    try:
+        try:
+            with open(SETTINGS) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        data[ws] = opts
+        os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+        with open(SETTINGS, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+def build_cmd(opts, selection):
+    cmd = ["colcon", "build", "--event-handlers", "console_cohesion+"]
+    if opts["symlink"]:
+        cmd.append("--symlink-install")
+    if opts["continue_on_error"]:
+        cmd.append("--continue-on-error")
+    if opts["jobs"]:
+        cmd += ["--parallel-workers", str(opts["jobs"])]
+    if opts["clean_cache"]:
+        cmd.append("--cmake-clean-cache")
+    if opts["force_configure"]:
+        cmd.append("--cmake-force-configure")
+    cmd += selection
+    cmd += shlex.split(opts["extra_colcon"] or "")
+    cmake = []
+    if opts["compile_commands"]:
+        cmake.append("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
+    if opts["build_type"]:
+        cmake.append(f"-DCMAKE_BUILD_TYPE={opts['build_type']}")
+    cmake += shlex.split(opts["extra_cmake"] or "")
+    if cmake:
+        cmd += ["--cmake-args", *cmake]
+    return cmd
+
+
+# ---------------------------------------------------------------------------
+# Plain output
+# ---------------------------------------------------------------------------
+def print_table(ws):
+    tty = sys.stdout.isatty()
+    col = {"OK": "32", "FAILED": "1;31", "ABORTED": "33", "SKIPPED": "35", "RUNNING": "36", "never": "2"}
+    c = (lambda code, s: f"\033[{code}m{s}\033[0m") if tty else (lambda code, s: s)
+    pk = sorted(ws.pkgs.values(), key=lambda p: p.order)
+    nw = max([len(p.name) for p in pk] + [7])
+    print(c("1", ws.root) + f"  ({len(pk)} packages)")
+    for p in pk:
+        bt = p.build_type if p.build_type else ("none" if p.build_type == "" else "-")
+        ew = (f"E:{p.n_err} " if p.n_err else "") + (f"W:{p.n_warn}" if p.n_warn else "")
+        print(f"  {p.name.ljust(nw)}  {p.short_type:<6}  {bt:<14}  "
+              f"{c(col.get(p.status, '0'), f'{p.status:<8}')}  {ago(p.t_end):<11}  "
+              f"{c('33', 'changed') if p.changed else '       '}  {ew}")
+
+
+# ---------------------------------------------------------------------------
+# curses interface
+# ---------------------------------------------------------------------------
+LIST_HELP = [
+    ("↑↓ j k PgUp PgDn g G", "move"),
+    ("ENTER", "action menu for the selected package"),
+    ("SPACE", "mark / unmark (actions apply to marked packages, else to the selected one)"),
+    ("M", "clear all marks"),
+    ("b", "build only selected/marked                     (cbp)"),
+    ("u", "build up to selected/marked (with dependencies) (cbu)"),
+    ("a", "build from selected/marked (with dependents)    (cbs)"),
+    ("A", "build from selected/marked + all their dependencies"),
+    ("B", "build the whole workspace                       (cb)"),
+    ("F", "rebuild the packages that failed in the last build"),
+    ("n", "build packages changed since their last build + dependents"),
+    ("R", "clean rebuild selected/marked (delete build/install, then build)"),
+    ("t", "cycle build type: Default / Debug / Release / RelWithDebInfo / MinSizeRel"),
+    ("O", "build options (jobs, symlink, extra args, ...)"),
+    ("x", "clean selected/marked (build/<pkg> and install/<pkg>)"),
+    ("X", "clean the whole workspace (build/, install/, optionally log/)"),
+    ("l", "build log of the selected package (errors / warnings)"),
+    ("L", "browse the last build with cbfail"),
+    ("e", "jump to the next failed package"),
+    ("d", "dependencies / dependents of the selected package"),
+    ("/", "filter by name (empty = no filter)"),
+    ("f", "show only problems (failed, skipped, changed, never built)"),
+    ("s", "sort: build order / name / status"),
+    ("o", "open a shell in the package directory (exit to return)"),
+    ("r", "reload packages and build status"),
+    ("q Esc", "quit"),
+]
+
+MENU = [
+    ("b", "Build only these", "--packages-select (cbp)"),
+    ("u", "Build up to", "with their dependencies (cbu)"),
+    ("a", "Build from", "with packages that depend on them (cbs)"),
+    ("A", "Build from + deps", "--packages-above-and-dependencies"),
+    ("R", "Clean rebuild", "delete build/install, then build them"),
+    ("x", "Clean", "delete build/<pkg> and install/<pkg>"),
+    ("l", "Build log", "errors and warnings of the last build"),
+    ("d", "Dependencies", "what it depends on / what depends on it"),
+    ("o", "Shell", "open a shell in the package directory"),
+]
+
+SORTS = ["build order", "name", "status"]
+
+
+class UI:
+    def __init__(self, scr, ws):
+        self.scr = scr
+        self.ws = ws
+        self.opts = load_settings(ws.root)
+        self.sel = 0
+        self.top = 0
+        self.filter = ""
+        self.only_problems = False
+        self.sort_mode = 0
+        self.marks = set()
+        self.msg = ""
+        self.msg_err = False
+        self.msg_time = 0
+        self.bg_busy = False
+        self.last_poll = 0
+
+    # --- drawing helpers ---------------------------------------------------
+    def C(self, n):
+        return curses.color_pair(n) if curses.has_colors() else 0
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return x
+        maxlen = w - x - (1 if y == h - 1 else 0)
+        if maxlen <= 0:
+            return x
+        t = text[:maxlen]
+        try:
+            self.scr.addstr(y, x, t, attr)
+        except curses.error:
+            pass
+        return x + len(t)
+
+    def put_segs(self, y, segs, x=0, extra=0, fill=False):
+        for text, attr in segs:
+            x = self.put(y, x, text, attr | extra)
+        if fill:
+            w = self.scr.getmaxyx()[1]
+            if x < w:
+                self.put(y, x, " " * (w - x), extra)
+        return x
+
+    def set_msg(self, text, err=False):
+        self.msg, self.msg_err, self.msg_time = text, err, time.time()
+
+    def draw_footer(self, keys):
+        h, w = self.scr.getmaxyx()
+        if self.msg and time.time() - self.msg_time < 10:
+            self.put(h - 2, 0, " " + self.msg, self.C(RED if self.msg_err else GREEN) | curses.A_BOLD)
+        x = 0
+        for k, label in keys:
+            x = self.put(h - 1, x, f" {k}", self.C(CYAN) | curses.A_BOLD)
+            x = self.put(h - 1, x, f" {label} ", curses.A_DIM)
+
+    def status_attr(self, st):
+        return {"OK": self.C(GREEN), "FAILED": self.C(RED) | curses.A_BOLD, "ABORTED": self.C(YELLOW),
+                "SKIPPED": self.C(MAGENTA), "RUNNING": self.C(CYAN) | curses.A_BOLD}.get(st, curses.A_DIM)
+
+    def help_overlay(self, title, items):
+        self.scr.clear()
+        self.put(0, 0, f" {title} ", self.C(TITLE) | curses.A_BOLD)
+        kw = max(len(k) for k, _ in items) + 2
+        for i, (k, v) in enumerate(items):
+            self.put(2 + i, 2, k.ljust(kw), self.C(CYAN) | curses.A_BOLD)
+            self.put(2 + i, 2 + kw, v)
+        self.put(3 + len(items), 2, "press any key to return", curses.A_DIM)
+        self.scr.timeout(-1)
+        self.scr.getch()
+        self.scr.timeout(300)
+
+    # --- input -------------------------------------------------------------
+    def prompt(self, label, initial=""):
+        buf = list(initial)
+        curses.curs_set(1)
+        self.scr.timeout(-1)
+        try:
+            while True:
+                h, w = self.scr.getmaxyx()
+                text = "".join(buf)
+                avail = w - len(label) - 2
+                shown = text[-avail:] if avail > 0 and len(text) > avail else text
+                self.scr.move(h - 1, 0)
+                self.scr.clrtoeol()
+                self.put(h - 1, 0, label, self.C(YELLOW) | curses.A_BOLD)
+                self.put(h - 1, len(label), shown)
+                try:
+                    self.scr.move(h - 1, min(w - 2, len(label) + len(shown)))
+                except curses.error:
+                    pass
+                try:
+                    ch = self.scr.get_wch()
+                except curses.error:
+                    continue
+                if ch in ("\n", "\r") or ch == curses.KEY_ENTER:
+                    return "".join(buf).strip()
+                if ch == "\x1b":
+                    return None
+                if ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    if buf:
+                        buf.pop()
+                elif ch == "\x15":  # ctrl-u
+                    buf = []
+                elif isinstance(ch, str) and ch.isprintable():
+                    buf.append(ch)
+        finally:
+            curses.curs_set(0)
+            self.scr.timeout(300)
+
+    def confirm(self, label):
+        h, w = self.scr.getmaxyx()
+        self.scr.move(h - 1, 0)
+        self.scr.clrtoeol()
+        self.put(h - 1, 0, label + " [y/N] ", self.C(YELLOW) | curses.A_BOLD)
+        self.scr.timeout(-1)
+        try:
+            ch = self.scr.getch()
+        finally:
+            self.scr.timeout(300)
+        return ch in (ord("y"), ord("Y"))
+
+    # --- background scans --------------------------------------------------
+    def reload(self, packages=True):
+        self.scr.erase()
+        self.put(0, 0, " Reading workspace..." if packages else " Reading build status...", curses.A_BOLD)
+        self.scr.refresh()
+        if packages:
+            self.ws.load_packages()
+            self.marks &= set(self.ws.pkgs)
+        self.ws.scan_history()
+        self.start_bg_scan()
+
+    def start_bg_scan(self):
+        if self.bg_busy:
+            return
+        self.bg_busy = True
+
+        def job():
+            try:
+                self.ws.scan_sources()
+                self.ws.scan_logs()
+            finally:
+                self.bg_busy = False
+        threading.Thread(target=job, daemon=True).start()
+
+    def poll(self):
+        """Every few seconds: notice external builds starting / ending."""
+        if time.time() - self.last_poll < 2:
+            return
+        self.last_poll = time.time()
+        was = self.ws.running_pid
+        now = colcon_running(self.ws.root)
+        if now or was:
+            self.ws.scan_history()
+            if was and not now:
+                self.start_bg_scan()
+                self.set_msg("external colcon build finished")
+
+    # --- terminal commands --------------------------------------------------
+    def run_term(self, cmd, cwd, banner=None, after=None, pause=True):
+        """Leave curses, run a command in the terminal, come back."""
+        curses.def_prog_mode()
+        curses.endwin()
+        old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        rc = 1
+        try:
+            print(f"\n\033[1;36m[{banner or os.path.relpath(cwd, self.ws.root)}]\033[0m "
+                  f"\033[1m$ {shlex.join(cmd)}\033[0m\n", flush=True)
+            try:
+                p = subprocess.Popen(cmd, cwd=cwd,
+                                     preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+                rc = p.wait()
+            except OSError as e:
+                print(e)
+            if after:
+                after(rc)
+            if pause:
+                col = "32" if rc == 0 else "31"
+                input(f"\n\033[{col}m[exit {rc}]\033[0m press ENTER to return to cbws... ")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        finally:
+            signal.signal(signal.SIGINT, old)
+        curses.reset_prog_mode()
+        self.scr.refresh()
+        return rc
+
+    def targets(self, cur):
+        if self.marks:
+            return sorted(self.marks, key=lambda n: self.ws.pkgs[n].order)
+        return [cur.name] if cur else []
+
+    def run_build(self, selection, label):
+        if self.ws.running_pid and not self.confirm(
+                f"colcon build already running (pid {self.ws.running_pid}). Start another one?"):
+            return
+        cmd = build_cmd(self.opts, selection)
+        t0 = time.time()
+        before = set(self.ws.builds())
+
+        def after(rc):
+            new = [b for b in self.ws.builds() if b not in before]
+            if new:
+                self.print_build_summary(new[0], time.time() - t0)
+            print("\a", end="", flush=True)
+        self.run_term(cmd, self.ws.root, banner=label, after=after)
+        self.ws.scan_history()
+        self.start_bg_scan()
+        new = [b for b in self.ws.builds() if b not in before]
+        if new:
+            ev = self.ws.parse_events(new[0])
+            failed = sorted(n for n, e in ev.items() if e["status"] in ("FAILED", "ABORTED"))
+            ok = sum(e["status"] == "OK" for e in ev.values())
+            skipped = sum(e["status"] == "SKIPPED" for e in ev.values())
+            if failed:
+                self.set_msg(f"build: {ok} ok, {len(failed)} failed ({', '.join(failed[:4])}"
+                             f"{', ...' if len(failed) > 4 else ''}), {skipped} skipped  - press l / e",
+                             err=True)
+                rs = self.visible()
+                for i, p in enumerate(rs):
+                    if p.name == failed[0]:
+                        self.sel = i
+                        break
+            else:
+                self.set_msg(f"build: {ok} ok" + (f", {skipped} skipped" if skipped else ""))
+
+    def print_build_summary(self, bdir, elapsed):
+        ev = self.ws.parse_events(bdir)
+        counts = {}
+        for e in ev.values():
+            if e["status"]:
+                counts[e["status"]] = counts.get(e["status"], 0) + 1
+        col = {"OK": "32", "FAILED": "1;31", "ABORTED": "33", "SKIPPED": "35", "RUNNING": "36"}
+        print("\n\033[1m=== cbws build summary\033[0m  " + "  ".join(
+            f"\033[{col.get(k, '0')}m{k}: {v}\033[0m"
+            for k, v in sorted(counts.items(), key=lambda kv: STATUS_ORDER.get(kv[0], 9)))
+            + f"  ({fmt_dur(elapsed)})")
+        for name, e in sorted(ev.items()):
+            if e["status"] not in ("FAILED", "ABORTED"):
+                continue
+            print(f"\n\033[1;31m--- {name} (rc={e['rc']})\033[0m")
+            if not cbfail:
+                continue
+            cp = cbfail.Package(name)
+            cbfail.load_output(cp, bdir)
+            errs = [l for l, k in zip(cp.lines, cp.kinds) if k == "E"]
+            for l in errs[:12]:
+                print("  " + l[:400])
+            if len(errs) > 12:
+                print(f"  ... {len(errs) - 12} more (open it with l in cbws)")
+
+    def build_action(self, key, cur):
+        tg = self.targets(cur)
+        if key == "B":
+            return self.run_build([], "build all")
+        if key == "F":
+            failed = [p.name for p in self.ws.pkgs.values() if p.status in ("FAILED", "ABORTED")]
+            if not failed:
+                return self.set_msg("no failed packages")
+            return self.run_build(["--packages-select", *failed], f"rebuild {len(failed)} failed")
+        if key == "n":
+            ch = [p.name for p in sorted(self.ws.pkgs.values(), key=lambda p: p.order) if p.changed]
+            if not ch:
+                return self.set_msg("no package changed since its last successful build"
+                                    + (" (still scanning...)" if self.bg_busy else ""))
+            return self.run_build(["--packages-above", *ch], f"changed: {' '.join(ch)}")
+        if not tg:
+            return
+        names = " ".join(tg)
+        if key == "b":
+            self.run_build(["--packages-select", *tg], f"only {names}")
+        elif key == "u":
+            self.run_build(["--packages-up-to", *tg], f"up to {names}")
+        elif key == "a":
+            self.run_build(["--packages-above", *tg], f"from {names}")
+        elif key == "A":
+            self.run_build(["--packages-above-and-dependencies", *tg], f"from {names} + deps")
+        elif key == "R":
+            if not self.confirm(f"Clean rebuild {len(tg)} package(s): {names}?"):
+                return
+            self.clean_pkgs(tg)
+            self.run_build(["--packages-select", *tg], f"clean rebuild {names}")
+
+    # --- cleaning ------------------------------------------------------------
+    def clean_pkgs(self, names):
+        removed = 0
+        for n in names:
+            for base in ("build", "install"):
+                d = os.path.join(self.ws.root, base, n)
+                if os.path.isdir(d) and not os.path.islink(d):
+                    shutil.rmtree(d, ignore_errors=True)
+                    removed += 1
+        return removed
+
+    def clean_selected(self, cur):
+        tg = self.targets(cur)
+        if not tg:
+            return
+        if self.ws.running_pid:
+            return self.set_msg("a colcon build is running: stop it first", err=True)
+        if not self.confirm(f"Delete build/ and install/ of {len(tg)} package(s): {' '.join(tg)}?"):
+            return
+        n = self.clean_pkgs(tg)
+        self.ws.scan_history()
+        self.set_msg(f"cleaned {len(tg)} package(s) ({n} directories removed)")
+
+    def clean_all(self):
+        if self.ws.running_pid:
+            return self.set_msg("a colcon build is running: stop it first", err=True)
+        if not self.confirm(f"Delete {self.ws.root}/build and /install?"):
+            return
+        logs = self.confirm("Also delete log/ (build history and logs)?")
+        for d in ("build", "install") + (("log",) if logs else ()):
+            shutil.rmtree(os.path.join(self.ws.root, d), ignore_errors=True)
+        self.marks.clear()
+        self.reload(packages=False)
+        self.set_msg("workspace cleaned" + (" (logs too)" if logs else ""))
+
+    # --- views -----------------------------------------------------------------
+    def view_log(self, p):
+        if not cbfail:
+            return self.set_msg("cbfail not found next to cbws: log viewer unavailable", err=True)
+        if not p.build_dir:
+            return self.set_msg(f"{p.name}: no build log", err=True)
+        app = cbfail.App.__new__(cbfail.App)
+        app.scr, app.build_dir, app.builds, app.problems_only = self.scr, p.build_dir, [p.build_dir], False
+        app.C = {"FAILED": self.C(RED) | curses.A_BOLD, "ABORTED": self.C(YELLOW), "OK": self.C(GREEN),
+                 "NOT BUILT": self.C(MAGENTA), "RUNNING": self.C(CYAN), "E": self.C(RED),
+                 "W": self.C(YELLOW), "hl": self.C(BLUE) | curses.A_BOLD}
+        cp = cbfail.Package(p.name)
+        cp.status, cp.rc = p.status, p.rc
+        self.scr.timeout(-1)
+        try:
+            app.view(cp)
+        finally:
+            self.scr.timeout(300)
+
+    def browse_builds(self):
+        if not cbfail:
+            return self.set_msg("cbfail not found next to cbws", err=True)
+        builds = self.ws.builds()
+        if not builds:
+            return self.set_msg("no builds in log/", err=True)
+        self.scr.timeout(-1)
+        try:
+            cbfail.App(self.scr, builds, 0).run()
+        finally:
+            self.scr.timeout(300)
+            self.init_colors()
+
+    def action_menu(self, p):
+        sel = 0
+        while True:
+            h, w = self.scr.getmaxyx()
+            bw = min(w - 4, 78)
+            bh = len(MENU) + 4
+            y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+            names = " ".join(self.targets(p))
+            title = f" {names} " if len(names) < bw - 4 else f" {len(self.targets(p))} marked packages "
+            self.put(y0, x0, "┌" + title.center(bw - 2, "─") + "┐", self.C(CYAN) | curses.A_BOLD)
+            for i, (k, label, desc) in enumerate(MENU):
+                y = y0 + 2 + i
+                attr = curses.A_REVERSE if i == sel else 0
+                self.put(y, x0, "│", self.C(CYAN))
+                line = f" {k}  {label:<26}{desc}"
+                self.put(y, x0 + 1, line[:bw - 2].ljust(bw - 2), attr)
+                self.put(y, x0 + 1, f" {k}", self.C(CYAN) | curses.A_BOLD | attr)
+                self.put(y, x0 + bw - 1, "│", self.C(CYAN))
+            for y in (y0 + 1, y0 + bh - 2):
+                self.put(y, x0, "│" + " " * (bw - 2) + "│", self.C(CYAN))
+            self.put(y0 + bh - 1, x0, "└" + "─" * (bw - 2) + "┘", self.C(CYAN))
+            self.scr.refresh()
+            self.scr.timeout(-1)
+            k = self.scr.getch()
+            self.scr.timeout(300)
+            if k in (ord("q"), 27, curses.KEY_LEFT):
+                return None
+            if k in (curses.KEY_DOWN, ord("j")):
+                sel = (sel + 1) % len(MENU)
+            elif k in (curses.KEY_UP, ord("k")):
+                sel = (sel - 1) % len(MENU)
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
+                return MENU[sel][0]
+            elif 0 < k < 256 and chr(k) in {m[0] for m in MENU}:
+                return chr(k)
+
+    def deps_view(self, p):
+        transitive = False
+        sel = 0
+        top = 0
+        while True:
+            if transitive:
+                deps, rdeps = self.ws.closure(p.name, "deps"), self.ws.closure(p.name, "rdeps")
+            else:
+                deps, rdeps = p.deps, p.rdeps
+            key = lambda n: self.ws.pkgs[n].order  # noqa
+            rows = [("h", f"Depends on ({len(deps)})")] + [("p", n) for n in sorted(deps, key=key)]
+            rows += [("s", "")] + [("h", f"Required by ({len(rdeps)})")] + [("p", n) for n in sorted(rdeps, key=key)]
+            pick = [i for i, r in enumerate(rows) if r[0] == "p"]
+            sel = max(0, min(sel, len(pick) - 1))
+            self.scr.clear()
+            h, w = self.scr.getmaxyx()
+            self.put_segs(0, [(" ← ", self.C(TITLE) | curses.A_BOLD),
+                              (f" {p.name} ", self.C(TITLE) | curses.A_BOLD),
+                              ("  " + ("all (transitive)" if transitive else "direct") + " dependencies",
+                               curses.A_DIM)])
+            body = h - 3
+            cur_row = pick[sel] if pick else 0
+            if cur_row < top:
+                top = cur_row
+            elif cur_row >= top + body:
+                top = cur_row - body + 1
+            for i, (kind, text) in enumerate(rows[top:top + body]):
+                y = 1 + i
+                if kind == "h":
+                    self.put(y, 1, text, curses.A_BOLD | curses.A_UNDERLINE)
+                elif kind == "p":
+                    q = self.ws.pkgs[text]
+                    extra = curses.A_REVERSE if top + i == cur_row and pick else 0
+                    self.put_segs(y, [("   " + text.ljust(40), 0),
+                                      (f"{q.status:<8}", self.status_attr(q.status)),
+                                      ("  changed" if q.changed else "", self.C(YELLOW))],
+                                  extra=extra, fill=bool(extra))
+            self.draw_footer([("↵", "go to package"), ("t", "direct / transitive"), ("q", "back")])
+            self.scr.refresh()
+            self.scr.timeout(-1)
+            k = self.scr.getch()
+            self.scr.timeout(300)
+            if k in (ord("q"), 27, curses.KEY_LEFT, ord("h")):
+                return None
+            elif k in (curses.KEY_DOWN, ord("j")):
+                sel += 1
+            elif k in (curses.KEY_UP, ord("k")):
+                sel -= 1
+            elif k == ord("t"):
+                transitive = not transitive
+                sel = top = 0
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT) and pick:
+                return rows[pick[sel]][1]
+
+    def options_menu(self):
+        sel = 0
+        items = [
+            ("build_type", "Build type (CMAKE_BUILD_TYPE)"),
+            ("jobs", "Parallel workers (0 = auto)"),
+            ("symlink", "--symlink-install"),
+            ("continue_on_error", "--continue-on-error"),
+            ("compile_commands", "compile_commands.json (CMAKE_EXPORT_COMPILE_COMMANDS)"),
+            ("clean_cache", "--cmake-clean-cache (re-run CMake from scratch)"),
+            ("force_configure", "--cmake-force-configure"),
+            ("extra_cmake", "Extra CMake args"),
+            ("extra_colcon", "Extra colcon build args"),
+        ]
+        self.scr.clear()
+        while True:
+            self.scr.erase()
+            h, w = self.scr.getmaxyx()
+            self.put(0, 0, " cbws - build options (saved for this workspace) ", self.C(TITLE) | curses.A_BOLD)
+            for i, (k, label) in enumerate(items):
+                v = self.opts[k]
+                if isinstance(v, bool):
+                    val, attr = ("on", self.C(GREEN) | curses.A_BOLD) if v else ("off", curses.A_DIM)
+                elif k == "build_type":
+                    val, attr = (v or "Default (not passed)"), self.C(MAGENTA) | curses.A_BOLD
+                elif k == "jobs":
+                    val, attr = (str(v) if v else "auto"), 0
+                else:
+                    val, attr = (v or "-"), 0 if v else curses.A_DIM
+                extra = curses.A_REVERSE if i == sel else 0
+                self.put_segs(2 + i, [("  " + label.ljust(58), 0), (val, attr)], extra=extra, fill=bool(extra))
+            cmd = shlex.join(build_cmd(self.opts, []))
+            self.put(3 + len(items), 2, "build all would run:", curses.A_DIM)
+            y = 4 + len(items)
+            while cmd and y < h - 2:
+                self.put(y, 4, cmd[:w - 6], self.C(CYAN))
+                cmd = cmd[w - 6:]
+                y += 1
+            self.draw_footer([("↵/space", "change"), ("t", "build type"), ("D", "defaults"), ("q", "back")])
+            self.scr.refresh()
+            self.scr.timeout(-1)
+            k = self.scr.getch()
+            self.scr.timeout(300)
+            key = items[sel][0]
+            if k in (ord("q"), 27, curses.KEY_LEFT):
+                return
+            elif k in (curses.KEY_DOWN, ord("j")):
+                sel = (sel + 1) % len(items)
+            elif k in (curses.KEY_UP, ord("k")):
+                sel = (sel - 1) % len(items)
+            elif k == ord("t"):
+                self.cycle_build_type()
+            elif k == ord("D"):
+                if self.confirm("Reset all options to defaults?"):
+                    self.opts = dict(DEFAULT_OPTS)
+            elif k in (10, 13, 32, curses.KEY_ENTER, curses.KEY_RIGHT):
+                v = self.opts[key]
+                if isinstance(v, bool):
+                    self.opts[key] = not v
+                elif key == "build_type":
+                    self.cycle_build_type()
+                elif key == "jobs":
+                    s = self.prompt("parallel workers (0 = auto): ", str(v or ""))
+                    if s is not None:
+                        self.opts[key] = int(s) if s.isdigit() else 0
+                else:
+                    s = self.prompt(f"{items[sel][1]}: ", v)
+                    if s is not None:
+                        try:
+                            shlex.split(s)
+                            self.opts[key] = s
+                        except ValueError as e:
+                            self.set_msg(f"invalid: {e}", err=True)
+            save_settings(self.ws.root, self.opts)
+
+    def cycle_build_type(self):
+        i = BUILD_TYPES.index(self.opts["build_type"]) if self.opts["build_type"] in BUILD_TYPES else 0
+        self.opts["build_type"] = BUILD_TYPES[(i + 1) % len(BUILD_TYPES)]
+        save_settings(self.ws.root, self.opts)
+
+    def do_shell(self, p):
+        sh = os.environ.get("SHELL", "/bin/bash")
+        self.run_term([sh], os.path.join(self.ws.root, p.path), banner=f"{p.name}: 'exit' to return to cbws",
+                      pause=False)
+
+    # --- list view -----------------------------------------------------------
+    def visible(self):
+        rs = list(self.ws.pkgs.values())
+        if self.filter:
+            rs = [p for p in rs if self.filter.lower() in p.name.lower()]
+        if self.only_problems:
+            rs = [p for p in rs if p.problem()]
+        if self.sort_mode == 0:
+            rs.sort(key=lambda p: p.order)
+        elif self.sort_mode == 1:
+            rs.sort(key=lambda p: p.name)
+        else:
+            rs.sort(key=lambda p: (STATUS_ORDER.get(p.status, 9), not p.changed, p.order))
+        return rs
+
+    def draw_list(self, rs):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        pk = self.ws.pkgs.values()
+        cnt = lambda st: sum(p.status == st for p in pk)  # noqa
+        n_fail = cnt("FAILED") + cnt("ABORTED")
+        n_chg = sum(p.changed for p in pk)
+        self.put_segs(0, [(" cbws ", self.C(TITLE) | curses.A_BOLD), (" " + self.ws.root, curses.A_BOLD)])
+        summ = [(f" {len(self.ws.pkgs)} packages  ", 0),
+                (f"✓ {cnt('OK')}  ", self.C(GREEN)),
+                (f"✗ {n_fail} failed  ", self.C(RED) | curses.A_BOLD if n_fail else curses.A_DIM),
+                (f"{cnt('SKIPPED')} skipped  ", self.C(MAGENTA) if cnt("SKIPPED") else curses.A_DIM),
+                (f"{cnt('never')} never built  ", curses.A_DIM),
+                (f"● {n_chg} changed  ", self.C(YELLOW) if n_chg else curses.A_DIM)]
+        if self.bg_busy:
+            summ.append(("⟳ scanning  ", self.C(MAGENTA)))
+        if self.ws.running_pid:
+            summ.append((f"⟳ colcon build running (pid {self.ws.running_pid})  ", self.C(CYAN) | curses.A_BOLD))
+        self.put_segs(1, summ)
+
+        o = self.opts
+        line = [(" type: ", curses.A_DIM), (o["build_type"] or "Default", self.C(MAGENTA) | curses.A_BOLD),
+                ("  jobs: ", curses.A_DIM), (str(o["jobs"]) if o["jobs"] else "auto", 0)]
+        for k, lab in (("symlink", "symlink"), ("continue_on_error", "continue-on-error"),
+                       ("compile_commands", "compile_commands")):
+            line.append(("  " + lab, (self.C(GREEN) if o[k] else curses.A_DIM)))
+        for k, lab in (("clean_cache", "CLEAN-CACHE"), ("force_configure", "FORCE-CONFIGURE")):
+            if o[k]:
+                line.append(("  " + lab, self.C(YELLOW) | curses.A_BOLD))
+        if o["extra_cmake"] or o["extra_colcon"]:
+            line.append(("  +extra args", self.C(YELLOW)))
+        flags = []
+        if self.marks:
+            flags.append(f"{len(self.marks)} marked")
+        if self.filter:
+            flags.append(f"filter: {self.filter}")
+        if self.only_problems:
+            flags.append("problems only")
+        flags.append("sort: " + SORTS[self.sort_mode])
+        line.append(("   [" + ", ".join(flags) + "]", self.C(YELLOW) if len(flags) > 1 else curses.A_DIM))
+        self.put_segs(2, line)
+
+        nw = min(max([len(p.name) for p in rs] + [7]), max(20, w // 3))
+        hdr = ("   " + "PACKAGE".ljust(nw) + "  " + "TYPE".ljust(7) + "CMAKE".ljust(9) + "STATUS".ljust(9)
+               + "WHEN".ljust(12) + "TIME".ljust(7) + "ERR/WARN".ljust(12) + "SRC".ljust(9) + "DEPS")
+        self.put(4, 0, hdr, curses.A_UNDERLINE | curses.A_DIM)
+
+        list_y = 5
+        list_h = max(1, h - list_y - 3)
+        if self.sel < self.top:
+            self.top = self.sel
+        if self.sel >= self.top + list_h:
+            self.top = self.sel - list_h + 1
+        if not rs:
+            self.put(list_y, 3, "no packages" + (" (filter active)" if self.filter or self.only_problems else ""),
+                     curses.A_DIM)
+        want_bt = o["build_type"]
+        for i, p in enumerate(rs[self.top:self.top + list_h]):
+            idx = self.top + i
+            extra = curses.A_REVERSE if idx == self.sel else 0
+            segs = [(" ✱ " if p.name in self.marks else "   ", self.C(CYAN) | curses.A_BOLD)]
+            name = p.name if len(p.name) <= nw else p.name[:nw - 1] + "…"
+            segs.append((name.ljust(nw) + "  ", curses.A_BOLD if p.status == "FAILED" else 0))
+            segs.append((p.short_type.ljust(7), curses.A_DIM))
+            if p.build_type is None:
+                segs.append(("".ljust(9), 0))
+            else:
+                bt = BT_SHORT.get(p.build_type, p.build_type) or "none"
+                mism = want_bt and p.build_type != want_bt
+                segs.append((bt.ljust(9), self.C(YELLOW) if mism else (curses.A_DIM if not p.build_type else 0)))
+            segs.append((("running" if p.status == "RUNNING" else p.status).ljust(9), self.status_attr(p.status)))
+            segs.append((ago(p.t_end).ljust(12), curses.A_DIM))
+            segs.append((fmt_dur(p.dur).ljust(7), curses.A_DIM))
+            ew = []
+            if p.n_err:
+                ew.append((f"E{p.n_err} ", self.C(RED)))
+            if p.n_warn:
+                ew.append((f"W{p.n_warn} ", self.C(YELLOW)))
+            n = sum(len(t) for t, _ in ew)
+            segs += ew + [(" " * max(0, 12 - n), 0)]
+            segs.append(("● changed" if p.changed else "         ", self.C(YELLOW)))
+            segs.append((f"  {len(p.deps)}↓ {len(p.rdeps)}↑", curses.A_DIM))
+            self.put_segs(list_y + i, segs, extra=extra, fill=bool(extra))
+
+        # detail line of the selected package
+        if rs:
+            p = rs[min(self.sel, len(rs) - 1)]
+            d = [(" " + p.path, self.C(BLUE)),
+                 (f"   depends on {len(p.deps)}, required by {len(p.rdeps)}", curses.A_DIM)]
+            if p.build_dir:
+                d.append((f"   last build: {os.path.basename(p.build_dir)}", curses.A_DIM))
+                if p.rc not in (None, "0"):
+                    d.append((f" (rc={p.rc})", self.C(RED)))
+            self.put_segs(h - 3, d)
+
+        self.draw_footer([("↵", "menu"), ("spc", "mark"), ("b", "only"), ("u", "up to"), ("a", "from"),
+                          ("B", "all"), ("F", "failed"), ("n", "changed"), ("t", "type"), ("x/X", "clean"),
+                          ("l", "log"), ("O", "options"), ("?", "help"), ("q", "quit")])
+        self.scr.refresh()
+        return list_h
+
+    def init_colors(self):
+        if not curses.has_colors():
+            return
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            bgc = -1
+        except curses.error:
+            bgc = curses.COLOR_BLACK
+        for pair, fg in ((RED, curses.COLOR_RED), (YELLOW, curses.COLOR_YELLOW), (GREEN, curses.COLOR_GREEN),
+                         (MAGENTA, curses.COLOR_MAGENTA), (CYAN, curses.COLOR_CYAN), (BLUE, curses.COLOR_BLUE)):
+            curses.init_pair(pair, fg, bgc)
+        curses.init_pair(TITLE, curses.COLOR_BLACK, curses.COLOR_CYAN)
+
+    def goto(self, name):
+        rs = self.visible()
+        for i, p in enumerate(rs):
+            if p.name == name:
+                self.sel = i
+                return
+        self.filter, self.only_problems = "", False
+        rs = self.visible()
+        self.sel = next((i for i, p in enumerate(rs) if p.name == name), 0)
+
+    def run(self):
+        curses.curs_set(0)
+        self.init_colors()
+        self.scr.timeout(300)
+        self.scr.keypad(True)
+        self.reload()
+        if self.ws.error:
+            raise SystemExit(f"cbws: {self.ws.error}")
+
+        self.need_clear = False
+        while True:
+            self.poll()
+            if self.need_clear:
+                self.scr.clear()
+                self.need_clear = False
+            rs = self.visible()
+            self.sel = max(0, min(self.sel, len(rs) - 1))
+            list_h = self.draw_list(rs)
+            k = self.scr.getch()
+            if k == -1 or k == curses.KEY_RESIZE:
+                continue
+            cur = rs[self.sel] if rs else None
+            ch = chr(k) if 0 < k < 256 else ""
+            if ch in ("j", "k", "g", "G", " ") or k in (
+                    curses.KEY_DOWN, curses.KEY_UP, curses.KEY_NPAGE, curses.KEY_PPAGE,
+                    curses.KEY_HOME, curses.KEY_END):
+                self.need_clear = False
+            else:
+                self.need_clear = True  # another screen may be shown: repaint fully afterwards
+            if k in (ord("q"), 27):
+                break
+            elif k in (curses.KEY_DOWN, ord("j")):
+                self.sel += 1
+            elif k in (curses.KEY_UP, ord("k")):
+                self.sel -= 1
+            elif k == curses.KEY_NPAGE:
+                self.sel += list_h
+            elif k == curses.KEY_PPAGE:
+                self.sel -= list_h
+            elif k in (curses.KEY_HOME, ord("g")):
+                self.sel = 0
+            elif k in (curses.KEY_END, ord("G")):
+                self.sel = len(rs) - 1
+            elif ch == "?":
+                self.help_overlay("cbws - colcon build manager", LIST_HELP)
+            elif ch == "r":
+                self.reload()
+                self.set_msg("reloaded")
+            elif ch in "BFn" and ch:
+                self.build_action(ch, cur)
+            elif ch == "t":
+                self.cycle_build_type()
+                self.set_msg(f"build type: {self.opts['build_type'] or 'Default (CMAKE_BUILD_TYPE not passed)'}")
+            elif ch == "O":
+                self.options_menu()
+            elif ch == "X":
+                self.clean_all()
+            elif ch == "L":
+                self.browse_builds()
+            elif ch == "M":
+                self.marks.clear()
+            elif ch == "f":
+                self.only_problems = not self.only_problems
+                self.sel = 0
+            elif ch == "s":
+                self.sort_mode = (self.sort_mode + 1) % len(SORTS)
+            elif ch == "/":
+                f = self.prompt("filter: ", self.filter)
+                if f is not None:
+                    self.filter = f
+                    self.sel = 0
+            elif ch == "e":
+                idx = [i for i, p in enumerate(rs) if p.status in ("FAILED", "ABORTED")]
+                if idx:
+                    self.sel = next((i for i in idx if i > self.sel), idx[0])
+                else:
+                    self.set_msg("no failed packages")
+            elif cur is None:
+                continue
+            elif ch == " ":
+                self.marks.symmetric_difference_update({cur.name})
+                self.sel += 1
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
+                a = self.action_menu(cur)
+                if a:
+                    self.do_pkg_action(a, cur)
+            elif ch and ch in "buaARxldo":
+                self.do_pkg_action(ch, cur)
+
+    def do_pkg_action(self, a, cur):
+        if a in "buaAR":
+            self.build_action(a, cur)
+        elif a == "x":
+            self.clean_selected(cur)
+        elif a == "l":
+            self.view_log(cur)
+        elif a == "d":
+            target = self.deps_view(cur)
+            if target:
+                self.goto(target)
+        elif a == "o":
+            self.do_shell(cur)
+
+
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Interactive colcon build manager for a ROS 2 workspace.")
+    ap.add_argument("-w", "--workspace", help="workspace root (default: search upwards from here)")
+    ap.add_argument("-s", "--status", action="store_true", help="print a status table and exit")
+    args = ap.parse_args()
+
+    if not shutil.which("colcon"):
+        sys.exit("cbws: colcon not found (source your ROS 2 setup first)")
+    root = os.path.realpath(args.workspace or find_ws(os.getcwd()))
+    if not os.path.isdir(os.path.join(root, "src")):
+        sys.exit(f"cbws: {root} does not look like a colcon workspace (no src/)")
+    if not os.environ.get("AMENT_PREFIX_PATH") and not os.environ.get("ROS_DISTRO"):
+        print("cbws: warning: no ROS environment sourced", file=sys.stderr)
+    ws = Workspace(root)
+
+    if args.status or not sys.stdout.isatty():
+        ws.load_packages()
+        if ws.error:
+            sys.exit(f"cbws: {ws.error}")
+        ws.scan_history()
+        ws.scan_sources()
+        ws.scan_logs()
+        print_table(ws)
+        return
+
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.wrapper(lambda scr: UI(scr, ws).run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
