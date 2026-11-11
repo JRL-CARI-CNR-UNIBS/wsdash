@@ -17,9 +17,9 @@ Download the scripts and copy them into `~/.local/bin`:
 ```bash
 BASE=https://github.com/JRL-CARI-CNR-UNIBS/wsdash/bin
 cd /tmp
-wget https://github.com/JRL-CARI-CNR-UNIBS/wsdash/tree/master/bin/cbws
-wget https://github.com/JRL-CARI-CNR-UNIBS/wsdash/tree/master/bin/gitws
-wget https://github.com/JRL-CARI-CNR-UNIBS/wsdash/tree/master/bin/cbfail
+wget https://raw.githubusercontent.com/JRL-CARI-CNR-UNIBS/wsdash/refs/heads/master/bin/cbws
+wget https://raw.githubusercontent.com/JRL-CARI-CNR-UNIBS/wsdash/refs/heads/master/bin/cbfail
+wget https://raw.githubusercontent.com/JRL-CARI-CNR-UNIBS/wsdash/refs/heads/master/bin/gitws
 mkdir -p ~/.local/bin
 cp cbws gitws cbfail ~/.local/bin/
 chmod +x ~/.local/bin/cbws ~/.local/bin/gitws ~/.local/bin/cbfail
