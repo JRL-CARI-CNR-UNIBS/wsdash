@@ -16,7 +16,9 @@ Main keys (press ? in the interface for the full list):
   repo list:   ENTER open, f/F fetch, p pull, P push, U ff-only pull of all,
                d only changed, / filter, s sort, o shell, r refresh, q quit
   detail:      SPACE stage/unstage, a/u stage/unstage all, ENTER diff,
-               c commit, C commit with editor, p pull, P push, l log, x discard
+               c commit, C commit with editor, p pull, P push, l log, x discard,
+               b branches
+  branches:    ENTER switch, n new branch, R show/hide remote, x delete
 """
 import argparse
 import curses
@@ -256,6 +258,36 @@ class Repo:
         self.refresh()
         return rc, err
 
+    def branches(self):
+        """Local and remote branches, most recently committed first."""
+        fmt = "%1f".join(["%(refname)", "%(refname:short)", "%(HEAD)", "%(upstream:short)",
+                          "%(upstream:track,nobracket)", "%(objectname:short)",
+                          "%(committerdate:relative)", "%(contents:subject)"])
+        rc, o, _ = git(self.path, "for-each-ref", "--sort=-committerdate",
+                       f"--format={fmt}", "refs/heads", "refs/remotes")
+        out = []
+        if rc != 0:
+            return out
+        for line in o.splitlines():
+            p = line.split("\x1f")
+            if len(p) < 8 or p[0].endswith("/HEAD"):
+                continue
+            remote = p[0].startswith("refs/remotes/")
+            rname = local = None
+            if remote:
+                rest = p[0][len("refs/remotes/"):]
+                for rm in sorted(self.remotes, key=len, reverse=True):
+                    if rest.startswith(rm + "/"):
+                        rname, local = rm, rest[len(rm) + 1:]
+                        break
+                else:
+                    rname, _, local = rest.partition("/")
+            out.append(dict(ref=p[0], name=p[1], current=p[2] == "*", upstream=p[3],
+                            track=p[4], oid=p[5], date=p[6], subject=p[7],
+                            remote=remote, rname=rname, local=local))
+        out.sort(key=lambda b: (not b["current"], b["remote"]))  # stable: keeps date order
+        return out
+
 
 # ---------------------------------------------------------------------------
 # curses interface
@@ -271,6 +303,7 @@ LIST_HELP = [
     ("P", "push the selected repo"),
     ("U", "pull --ff-only all repos that are behind and have no changes"),
     ("l", "log of the selected repo"),
+    ("b", "branches of the selected repo (switch / create / delete)"),
     ("d", "show only repos that need attention"),
     ("/", "filter by name (empty = no filter)"),
     ("s", "sort by name / by urgency"),
@@ -290,11 +323,23 @@ REPO_HELP = [
     ("p / P", "pull / push"),
     ("f", "fetch"),
     ("l", "graph log (HEAD and upstream)"),
+    ("b", "branches (switch / create / delete)"),
     ("x", "discard changes to the file / delete untracked file"),
     ("z", "git stash push  (Z = stash pop)"),
     ("o", "open a shell in the repo"),
     ("r", "reload"),
     ("q ← Esc", "back to the list"),
+]
+BRANCH_HELP = [
+    ("↑↓ j k PgUp PgDn g G", "select branch"),
+    ("ENTER / →", "switch to the branch (remote: creates a local tracking branch)"),
+    ("n", "create a new branch from HEAD and switch to it"),
+    ("R", "show / hide remote branches"),
+    ("x", "delete the local branch (git branch -d, asks again for -D)"),
+    ("l", "graph log of the selected branch"),
+    ("f", "fetch"),
+    ("r", "reload"),
+    ("q ← Esc", "back"),
 ]
 
 
@@ -718,6 +763,11 @@ class UI:
                 self.do_push(cur)
             elif k == ord("l"):
                 self.do_log(cur)
+            elif k == ord("b"):
+                if cur.error:
+                    self.set_msg(cur.error, err=True)
+                else:
+                    self.branch_view(cur)
             elif k == ord("o"):
                 self.do_shell(cur)
         self.pool.shutdown(wait=False, cancel_futures=True)
@@ -815,8 +865,8 @@ class UI:
 
         self.draw_footer([("space", "stage"), ("a/u", "stage/unstage all"), ("↵", "diff"),
                           ("c", "commit"), ("p", "pull"), ("P", "push"), ("f", "fetch"),
-                          ("l", "log"), ("x", "discard"), ("o", "shell"), ("?", "help"),
-                          ("q", "back")])
+                          ("l", "log"), ("b", "branches"), ("x", "discard"), ("o", "shell"),
+                          ("?", "help"), ("q", "back")])
         self.scr.refresh()
         return top, files_h
 
@@ -856,6 +906,9 @@ class UI:
                 self.do_push(r)
             elif k == ord("l"):
                 self.do_log(r)
+            elif k == ord("b"):
+                self.branch_view(r)
+                sel = top = 0
             elif k == ord("o"):
                 self.do_shell(r)
             elif k == ord("a"):
@@ -884,6 +937,181 @@ class UI:
                 self.show_diff(r, f)
             elif k == ord("x"):
                 self.discard(r, f)
+
+    # --- branch view ---------------------------------------------------------
+    def draw_branches(self, r, bs, sel, top, show_remote):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        self.put_segs(0, [(" ← ", self.C(TITLE) | curses.A_BOLD),
+                          (" " + r.name + " · branches ", self.C(TITLE) | curses.A_BOLD),
+                          ("  " + r.path, curses.A_DIM),
+                          ("  ⟳" if r.busy else "", self.C(MAGENTA) | curses.A_BOLD)])
+        segs = [("current: ", curses.A_DIM), (r.branch_label(), self.C(MAGENTA) | curses.A_BOLD), ("   ", 0)]
+        segs += self.sync_segs(r) + [("   ", 0)] + self.change_segs(r)
+        nl = sum(not b["remote"] for b in bs)
+        segs += [(f"   {nl} local", curses.A_DIM)]
+        if show_remote:
+            segs += [(f", {len(bs) - nl} remote", curses.A_DIM)]
+        self.put_segs(1, segs)
+
+        nw = min(max([len(b["name"]) for b in bs] + [6]), max(20, w // 3))
+        uw = min(max([len(b["upstream"]) for b in bs] + [8]), 30)
+        self.put(3, 0, "  " + "BRANCH".ljust(nw) + "  " + "UPSTREAM".ljust(uw) + "  "
+                 + "SYNC".ljust(14) + "LAST COMMIT", curses.A_UNDERLINE | curses.A_DIM)
+        list_y = 4
+        list_h = max(1, h - list_y - 2)
+        if sel < top:
+            top = sel
+        if sel >= top + list_h:
+            top = sel - list_h + 1
+        if not bs:
+            self.put(list_y, 2, "no branches (no commits yet?)", curses.A_DIM)
+        for i, b in enumerate(bs[top:top + list_h]):
+            idx = top + i
+            extra = curses.A_REVERSE if idx == sel else 0
+            name = b["name"] if len(b["name"]) <= nw else b["name"][:nw - 1] + "…"
+            if b["current"]:
+                segs = [("* ", self.C(GREEN) | curses.A_BOLD), (name.ljust(nw), self.C(GREEN) | curses.A_BOLD)]
+            elif b["remote"]:
+                segs = [("  ", 0), (name.ljust(nw), self.C(RED))]
+            else:
+                segs = [("  ", 0), (name.ljust(nw), self.C(MAGENTA))]
+            up = b["upstream"] if len(b["upstream"]) <= uw else b["upstream"][:uw - 1] + "…"
+            segs.append(("  " + up.ljust(uw) + "  ", curses.A_DIM))
+            tr = b["track"]
+            if b["remote"]:
+                tseg = [("remote", curses.A_DIM)]
+            elif not b["upstream"]:
+                tseg = [("local only", self.C(MAGENTA) | curses.A_DIM)]
+            elif tr == "gone":
+                tseg = [("upstream gone", self.C(RED))]
+            elif tr:
+                tseg = []
+                for part in tr.split(", "):
+                    kind, _, n = part.partition(" ")
+                    if kind == "ahead":
+                        tseg.append((f"↑{n} ", self.C(CYAN) | curses.A_BOLD))
+                    elif kind == "behind":
+                        tseg.append((f"↓{n} ", self.C(RED) | curses.A_BOLD))
+            else:
+                tseg = [("✓ sync", self.C(GREEN))]
+            segs += self.pad(tseg, 14)
+            segs += [(b["oid"] + " ", self.C(YELLOW)), (b["subject"], 0), (f"  ({b['date']})", curses.A_DIM)]
+            self.put_segs(list_y + i, segs, extra=extra, fill=bool(extra))
+        if len(bs) > list_h:
+            self.put(list_y + list_h - 1, w - 12, f" {sel + 1}/{len(bs)} ", curses.A_DIM)
+
+        self.draw_footer([("↵", "switch"), ("n", "new"), ("R", "remote " + ("off" if show_remote else "on")),
+                          ("x", "delete"), ("l", "log"), ("f", "fetch"), ("r", "reload"),
+                          ("?", "help"), ("q", "back")])
+        self.scr.refresh()
+        return top, list_h
+
+    def branch_view(self, r):
+        sel = top = 0
+        show_remote = True
+        r.refresh()
+
+        def load():
+            return [b for b in r.branches() if show_remote or not b["remote"]]
+        bs = load()
+        last_busy = r.busy
+        while True:
+            if r.busy != last_busy:  # a background fetch finished: reload the list
+                last_busy = r.busy
+                bs = load()
+            sel = max(0, min(sel, len(bs) - 1))
+            top, list_h = self.draw_branches(r, bs, sel, top, show_remote)
+            k = self.scr.getch()
+            if k == -1 or k == curses.KEY_RESIZE:
+                continue
+            b = bs[sel] if bs else None
+            if k in (ord("q"), 27, curses.KEY_LEFT, ord("h")):
+                return
+            elif k in (curses.KEY_DOWN, ord("j")):
+                sel += 1
+            elif k in (curses.KEY_UP, ord("k")):
+                sel -= 1
+            elif k == curses.KEY_NPAGE:
+                sel += list_h
+            elif k == curses.KEY_PPAGE:
+                sel -= list_h
+            elif k in (curses.KEY_HOME, ord("g")):
+                sel = 0
+            elif k in (curses.KEY_END, ord("G")):
+                sel = len(bs) - 1
+            elif k == ord("?"):
+                self.help_overlay(f"gitws - {r.name} - branches", BRANCH_HELP)
+            elif k == ord("r"):
+                r.refresh()
+                bs = load()
+            elif k == ord("f"):
+                self.bg(r, r.fetch)
+                last_busy = r.busy
+            elif k == ord("R"):
+                show_remote = not show_remote
+                bs = load()
+                sel = 0
+            elif k == ord("n"):
+                name = self.prompt("new branch name (from HEAD, Esc cancels): ")
+                if name:
+                    if self.git_action(r, ["switch", "-c", name], f"created and switched to '{name}'") == 0:
+                        bs, sel = load(), 0
+            elif b is None:
+                continue
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
+                if self.switch_branch(r, b):
+                    bs, sel = load(), 0
+            elif k == ord("x"):
+                self.delete_branch(r, b)
+                bs = load()
+            elif k == ord("l"):
+                self.run_term(["git", "-p", "log", "--graph", "--decorate", "--color=always",
+                               "--format=%C(yellow)%h%C(auto)%d %s %C(dim)(%cr, %an)%C(reset)",
+                               b["ref"]], r.path, pause=False, pager=True)
+
+    def switch_branch(self, r, b):
+        if b["current"]:
+            self.set_msg(f"already on '{b['name']}'")
+            return False
+        if r.state:
+            self.set_msg(f"{r.state} in progress: finish or abort it first", err=True)
+            return False
+        if b["remote"]:
+            local = b["local"]
+            rc, _, _ = git(r.path, "show-ref", "--verify", "--quiet", f"refs/heads/{local}")
+            if rc == 0:
+                if not self.confirm(f"Local branch '{local}' already exists: switch to it?"):
+                    return False
+                args = ["switch", local]
+            else:
+                args = ["switch", "-c", local, "--track", b["name"]]
+        else:
+            local = b["name"]
+            args = ["switch", local]
+        if (r.n_staged or r.n_unstaged) and not self.confirm(
+                f"Uncommitted changes will be carried to '{local}' (git refuses if they conflict). Continue?"):
+            return False
+        return self.git_action(r, args, f"switched to '{local}'") == 0
+
+    def delete_branch(self, r, b):
+        if b["remote"]:
+            self.set_msg("remote branch: not deleting it from here (use git push --delete)", err=True)
+            return
+        if b["current"]:
+            self.set_msg("cannot delete the current branch", err=True)
+            return
+        if not self.confirm(f"Delete local branch '{b['name']}'?"):
+            return
+        rc, out, err = git(r.path, "branch", "-d", b["name"], env=os.environ)
+        if rc == 0:
+            self.set_msg(f"deleted '{b['name']}'")
+        elif "not fully merged" in err:
+            if self.confirm(f"'{b['name']}' is NOT fully merged: force delete (-D), losing its commits?"):
+                self.git_action(r, ["branch", "-D", b["name"]], f"force-deleted '{b['name']}'")
+        else:
+            self.set_msg(f"git branch -d: {last_line(err or out)}", err=True)
+        r.refresh()
 
     def git_action(self, r, args, ok_msg):
         rc, out, err = git(r.path, *args, env=os.environ)

@@ -5,7 +5,7 @@ Two terminal (curses) tools for working in a ROS 2 workspace:
 | Tool     | What it does                                                        |
 |----------|---------------------------------------------------------------------|
 | `cbws`   | Interactive `colcon build` manager: status of every package, build/clean selections, view logs |
-| `gitws`  | Overview of all git repositories under a directory: status, stage, commit, pull, push |
+| `gitws`  | Overview of all git repositories under a directory: status, stage, commit, pull, push, branches |
 | `cbfail` | Build-log viewer (errors/warnings per package). Used by `cbws`, also works on its own |
 
 All three are single-file Python 3 scripts using only the standard library.
@@ -149,6 +149,7 @@ gitws -l             # print the table and exit
 | `p` / `P` | pull / push selected |
 | `U` | `pull --ff-only` every repo that is behind and has no local changes |
 | `l` | log |
+| `b` | branches of the selected repo |
 | `d` | show only repos that need attention |
 | `/` | filter by name |
 | `s` | sort by name / urgency |
@@ -173,9 +174,29 @@ gitws -l             # print the table and exit
 | `l` | graph log (HEAD and upstream) |
 | `x` | discard changes to the file / delete untracked file (asks confirmation) |
 | `z` / `Z` | `git stash push` / `git stash pop` |
+| `b` | branches |
 | `o` | open a shell |
 | `r` | reload |
+| `?` | help |
 | `q ← Esc` | back to the list |
+
+### Keys — branches
+
+Local and remote branches, current first, then most recently committed. Each row shows the
+upstream, sync state (`↑N` / `↓N`, `✓ sync`, `local only`, `upstream gone`) and the last commit.
+
+| Key | Action |
+|-----|--------|
+| `↑↓ j k PgUp PgDn g G` | select branch |
+| `ENTER / →` | switch to the branch (a remote branch creates a local tracking branch) |
+| `n` | create a new branch from HEAD and switch to it |
+| `R` | show / hide remote branches |
+| `x` | delete the local branch (`git branch -d`, asks again for `-D` if not merged) |
+| `l` | graph log of the selected branch |
+| `f` | fetch |
+| `r` | reload |
+| `?` | help |
+| `q ← Esc` | back |
 
 ---
 

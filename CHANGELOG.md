@@ -6,6 +6,14 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-17
+
+### Added
+- `gitws`: branch view (`b` from the list or inside a repo).
+  - Local and remote branches with upstream, ahead/behind and last commit.
+  - Switch (remote branches get a local tracking branch), create from HEAD, delete local
+    branches (`-d`, then `-D` on confirmation), show/hide remotes, per-branch graph log.
+
 ## [1.0.0] - 2026-11-11
 
 ### Added
